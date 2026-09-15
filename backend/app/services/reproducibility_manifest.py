@@ -10,6 +10,13 @@
 就不是确定性的，MiroFish 也没有向 LLM API 传递 seed 参数；OASIS 内部的
 随机性同样不受此处控制。清单中的 `randomness` 字段明确说明了这一点，
 而不是假装提供了它做不到的保证。
+
+范围限制：这份清单只捕获"准备阶段"（prepare_simulation）的执行条件，
+不包含只有在"运行阶段"（/api/simulation/start）才会确定的事实——例如
+调用方传入的 max_rounds 覆盖值，或 run_parallel_simulation.py 在启用
+LLM_BOOST_* 配置时为 OASIS Agent 实际选用的加速模型（可能与本清单
+`model` 字段记录的准备阶段模型不同）。将清单扩展到覆盖运行阶段、并在
+/start 时更新它，是一项独立的后续工作。
 """
 
 import hashlib
