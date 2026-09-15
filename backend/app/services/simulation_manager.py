@@ -6,7 +6,6 @@ OASIS模拟管理器
 
 import os
 import json
-import random
 import secrets
 import shutil
 from typing import Dict, Any, List, Optional
@@ -340,7 +339,12 @@ class SimulationManager:
         state = self._load_simulation_state(simulation_id)
         if not state:
             raise ValueError(f"模拟不存在: {simulation_id}")
-        
+
+        # 兼容在引入 random_seed 字段之前创建的模拟：补发一个种子，
+        # 使其也能获得可复现、可在清单中记录的随机性。
+        if state.random_seed is None:
+            state.random_seed = secrets.randbits(32)
+
         try:
             state.status = SimulationStatus.PREPARING
             state.error = None
@@ -394,13 +398,14 @@ class SimulationManager:
                     total=total_entities
                 )
             
-            # 用该模拟的随机种子控制 MiroFish 自身的非 LLM 随机性（Profile
-            # 兜底默认值等）。不影响 LLM 采样本身的确定性，详见
+            # 传入该模拟的随机种子，用于让 Profile 生成过程中的兜底随机默认值
+            # （karma/年龄/性别/MBTI等）可复现。OasisProfileGenerator 内部为
+            # 每个实体构造独立的 random.Random 实例，而不是重新播种进程全局
+            # 的 random 模块——后者会在多个模拟并行准备（各自的线程池中）时
+            # 相互踩踏彼此的随机序列。不影响 LLM 采样本身的确定性，详见
             # reproducibility_manifest.py 中 RandomnessInfo 的说明。
-            random.seed(state.random_seed)
-
             # 传入graph_id以启用Zep检索功能，获取更丰富的上下文
-            generator = OasisProfileGenerator(graph_id=state.graph_id)
+            generator = OasisProfileGenerator(graph_id=state.graph_id, random_seed=state.random_seed)
             
             def profile_progress(current, total, msg):
                 if progress_callback:

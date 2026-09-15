@@ -46,8 +46,9 @@ class _FakeProfile:
 
 
 class _FakeProfileGenerator:
-    def __init__(self, graph_id=None):
+    def __init__(self, graph_id=None, random_seed=None):
         self.graph_id = graph_id
+        self.random_seed = random_seed
 
     def generate_profiles_from_entities(
         self,
