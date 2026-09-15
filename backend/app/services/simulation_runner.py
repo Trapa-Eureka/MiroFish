@@ -27,6 +27,7 @@ from ..utils.zep import (
 )
 from .zep_graph_memory_updater import ZepGraphMemoryManager
 from .simulation_ipc import SimulationIPCClient, CommandType, IPCResponse
+from . import simulation_checkpoint
 from ..utils.id_validation import validate_simulation_id, safe_join
 from ..utils.state_machine import (
     ConcurrentModificationError,
@@ -731,7 +732,8 @@ class SimulationRunner:
         
         twitter_position = 0
         reddit_position = 0
-        
+        last_checkpoint_round = -1
+
         monitor_error: Exception | None = None
         exit_code: int | None = None
         try:
@@ -741,15 +743,27 @@ class SimulationRunner:
                     twitter_position = cls._read_action_log(
                         twitter_actions_log, twitter_position, state, "twitter"
                     )
-                
+
                 # 读取 Reddit 动作日志
                 if os.path.exists(reddit_actions_log):
                     reddit_position = cls._read_action_log(
                         reddit_actions_log, reddit_position, state, "reddit"
                     )
-                
+
                 # 更新状态
                 cls._save_run_state(state)
+
+                # 每当轮次前进时记录一次检查点（记录"跑到哪儿了"，不代表可
+                # 真正从该点续跑——见 simulation_checkpoint.py 模块说明）
+                if state.current_round > last_checkpoint_round:
+                    try:
+                        simulation_checkpoint.save_checkpoint(
+                            sim_dir, simulation_checkpoint.build_checkpoint_from_state(state)
+                        )
+                        last_checkpoint_round = state.current_round
+                    except Exception:
+                        logger.exception(f"保存检查点失败: simulation_id={simulation_id}")
+
                 time.sleep(2)
             
             # 进程结束后，最后读取一次日志
@@ -826,6 +840,16 @@ class SimulationRunner:
                             desired_status = RunnerStatus.FAILED
                             error_message = f"Zep图谱写入未完整完成: {error}"
 
+                    if desired_status == RunnerStatus.FAILED and error_message:
+                        # 诚实说明：该模拟已跑到的进度不可用于真正续跑，
+                        # 必须从 round 0 重新开始。见 simulation_checkpoint.py。
+                        error_message = (
+                            f"{error_message}\n\n"
+                            f"已到达轮次: twitter={state.twitter_current_round}, "
+                            f"reddit={state.reddit_current_round}（共 {state.total_rounds} 轮）。"
+                            f"{simulation_checkpoint.RESUME_LIMITATION_NOTE}"
+                        )
+
                     state.runner_status = desired_status
                     state.error = error_message
                     state.completed_at = datetime.now().isoformat()
@@ -835,6 +859,12 @@ class SimulationRunner:
                         desired_status,
                         error_message,
                     )
+                    try:
+                        simulation_checkpoint.save_checkpoint(
+                            sim_dir, simulation_checkpoint.build_checkpoint_from_state(state)
+                        )
+                    except Exception:
+                        logger.exception(f"保存最终检查点失败: simulation_id={simulation_id}")
                     if desired_status == RunnerStatus.COMPLETED:
                         logger.info(f"模拟完成: {simulation_id}")
                     else:

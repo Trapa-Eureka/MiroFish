@@ -1414,6 +1414,45 @@ def get_simulation_manifest(simulation_id: str):
         }), 500
 
 
+@simulation_bp.route('/<simulation_id>/checkpoint', methods=['GET'])
+def get_simulation_checkpoint(simulation_id: str):
+    """
+    获取模拟的检查点（Checkpoint）
+
+    记录该模拟运行已确认到达的轮次与动作数量水位线，用于在进程崩溃/被杀死
+    后准确了解"跑到哪一轮了"。
+
+    重要限制：这不是可用于真正恢复执行的状态快照——OASIS/camel-ai 的
+    Agent 记忆完全保存在进程内存中且不可序列化，因此必须从 round 0
+    重新开始一次全新的模拟。详见返回数据中的 `resume_limitation` 字段。
+    """
+    _authorize_simulation_access(simulation_id)
+    try:
+        from ..services import simulation_checkpoint
+
+        sim_dir = SimulationRunner._get_sim_dir(simulation_id)
+        checkpoint = simulation_checkpoint.load_checkpoint(sim_dir)
+
+        if not checkpoint:
+            return jsonify({
+                "success": False,
+                "error": t('api.checkpointNotFound')
+            }), 404
+
+        return jsonify({
+            "success": True,
+            "data": checkpoint
+        })
+
+    except Exception as e:
+        logger.error(f"获取检查点失败: {str(e)}")
+        return jsonify({
+            "success": False,
+            "error": str(e),
+            "traceback": traceback.format_exc()
+        }), 500
+
+
 @simulation_bp.route('/<simulation_id>/config/download', methods=['GET'])
 def download_simulation_config(simulation_id: str):
     """下载模拟配置文件"""
