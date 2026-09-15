@@ -18,6 +18,16 @@ checkpoint/resume/save_state/load_state）。因此一旦运行该模拟的子�
 这个模块做的是诚实地记录"模拟到底跑到哪儿了"，而不是假装提供一个当前
 架构做不到的"续跑"能力。真正的续跑需要 OASIS/camel-ai 自身先支持
 Agent 记忆与环境状态的序列化。
+
+另一个已知的架构性限制——单进程假设：SimulationRunner 把子进程句柄
+（_processes）、监控线程（_monitor_threads）、IPC 队列等全部保存在
+本进程的内存字典中，这些东西本来就无法跨进程共享。也就是说，即便在
+多 worker 部署下共享同一份磁盘目录，也只有真正启动了某个模拟的那个
+worker 进程能够停止/监控它——这是 SimulationRunner 整体架构自带的限制，
+不是这个检查点功能引入的。因此这里没有专门为"另一个进程的内存缓存
+读到过期的 run_state"这类场景做额外处理；要修好它需要重新设计
+SimulationRunner 的进程模型（参见路线图中 P2 的 simulation_runner.py
+拆分项），超出了本模块的范围。
 """
 
 import json
@@ -84,7 +94,15 @@ def load_checkpoint(sim_dir: str) -> Optional[Dict[str, Any]]:
 
 
 def build_checkpoint_from_state(state) -> Checkpoint:
-    """从 SimulationRunState 构建一份检查点快照。"""
+    """
+    从 SimulationRunState 构建一份检查点快照。
+
+    checkpointed_at 使用 state.updated_at，而不是构建时的当前时间：
+    updated_at 只在 SimulationRunState.add_action() 里被更新——也就是
+    真正观察到新动作/轮次推进时——而不是每次保存或每次被轮询时都刷新。
+    这样 API 消费者才能用这个时间戳判断"模拟上一次真正取得进展是什么时候"，
+    而不是每次请求都看到一个变化的时间戳、误以为模拟仍在推进。
+    """
     return Checkpoint(
         simulation_id=state.simulation_id,
         twitter_round=state.twitter_current_round,
@@ -93,4 +111,5 @@ def build_checkpoint_from_state(state) -> Checkpoint:
         twitter_action_count=state.twitter_actions_count,
         reddit_action_count=state.reddit_actions_count,
         runner_status=state.runner_status.value,
+        checkpointed_at=state.updated_at,
     )

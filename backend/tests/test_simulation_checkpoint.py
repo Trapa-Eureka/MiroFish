@@ -69,6 +69,29 @@ class TestBuildCheckpointFromState:
         assert cp.reddit_action_count == 95
         assert cp.runner_status == "running"
 
+    def test_checkpointed_at_uses_updated_at_not_build_time(self):
+        """
+        Regression test for Codex's round-9 finding: checkpointed_at must
+        reflect when the simulation last actually made progress
+        (SimulationRunState.updated_at, only bumped by add_action()), not
+        the wall-clock time this function happened to be called at -- so a
+        client polling the live-derived checkpoint doesn't see a constantly
+        moving timestamp for a simulation that isn't actually progressing.
+        """
+        fixed_progress_time = "2020-01-01T00:00:00"
+        state = SimulationRunState(
+            simulation_id="sim_test1234",
+            runner_status=RunnerStatus.RUNNING,
+            updated_at=fixed_progress_time,
+        )
+        cp = build_checkpoint_from_state(state)
+        assert cp.checkpointed_at == fixed_progress_time
+
+        # Building it again "later" (simulating a second poll with no
+        # progress in between) must yield the same timestamp, not "now".
+        cp_again = build_checkpoint_from_state(state)
+        assert cp_again.checkpointed_at == fixed_progress_time
+
 
 class TestSaveAndLoadCheckpoint:
     def test_round_trip(self, tmp_path):
