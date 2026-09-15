@@ -472,18 +472,26 @@ class SimulationRunner:
         platform: str = "parallel",  # twitter / reddit / parallel
         max_rounds: int = None,  # 最大模拟轮数（可选，用于截断过长的模拟）
         enable_graph_memory_update: bool = False,  # 是否将活动更新到Zep图谱
-        graph_id: str = None  # Zep图谱ID（启用图谱更新时必需）
+        graph_id: str = None,  # Zep图谱ID（启用图谱更新时必需）
+        no_wait: bool = False  # 完成所有轮次后立即退出，不等待interview/close命令
     ) -> SimulationRunState:
         """
         启动模拟
-        
+
         Args:
             simulation_id: 模拟ID
             platform: 运行平台 (twitter/reddit/parallel)
             max_rounds: 最大模拟轮数（可选，用于截断过长的模拟）
             enable_graph_memory_update: 是否将Agent活动动态更新到Zep图谱
             graph_id: Zep图谱ID（启用图谱更新时必需）
-            
+            no_wait: 为 True 时对子进程附加 --no-wait，使其在跑完所有轮次后
+                立即退出，而不是像交互式单次模拟那样停留在等待
+                interview/close 命令的状态。默认 False，保持单次模拟现有的
+                "跑完后留给前端手动 interview/close" 行为不变；目前仅由
+                EnsembleRunner 传入 True——集成成员没有人工操作者去调用
+                close，必须自己退出进程，SimulationRunner 才能把它标记为
+                COMPLETED。
+
         Returns:
             SimulationRunState
         """
@@ -691,7 +699,10 @@ class SimulationRunner:
             # 如果指定了最大轮数，添加到命令行参数
             if max_rounds is not None and max_rounds > 0:
                 cmd.extend(["--max-rounds", str(max_rounds)])
-            
+
+            if no_wait:
+                cmd.append("--no-wait")
+
             # 创建主日志文件，避免 stdout/stderr 管道缓冲区满导致进程阻塞
             main_log_path = os.path.join(sim_dir, "simulation.log")
             main_log_file = open(main_log_path, 'w', encoding='utf-8')
