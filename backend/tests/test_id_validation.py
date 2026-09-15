@@ -14,6 +14,7 @@ from app.utils.id_validation import (
     InvalidIdentifierError,
     PathContainmentError,
     safe_join,
+    validate_backtest_id,
     validate_ensemble_id,
     validate_graph_id,
     validate_platform_name,
@@ -64,6 +65,7 @@ TRAVERSAL_PAYLOADS = [
         validate_report_id,
         validate_graph_id,
         validate_ensemble_id,
+        validate_backtest_id,
     ],
 )
 def test_valid_identifiers_pass(validator, value):
@@ -79,6 +81,7 @@ def test_valid_identifiers_pass(validator, value):
         validate_report_id,
         validate_graph_id,
         validate_ensemble_id,
+        validate_backtest_id,
     ],
 )
 def test_malicious_identifiers_rejected(validator, payload):
