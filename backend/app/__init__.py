@@ -9,12 +9,16 @@ import warnings
 # 需要在所有其他导入之前设置
 warnings.filterwarnings("ignore", message=".*resource_tracker.*")
 
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, g
 from flask_cors import CORS
 
 from .config import Config
 from .utils.logger import setup_logger, get_logger
 from .utils.id_validation import InvalidIdentifierError, PathContainmentError
+from .utils.auth import authenticate_request, AuthenticationError
+
+# /health 不需要认证；其余路径均为 /api/* 蓝图路由
+AUTH_EXEMPT_PATHS = {'/health'}
 
 
 def create_app(config_class=Config):
@@ -48,7 +52,26 @@ def create_app(config_class=Config):
     SimulationRunner.register_cleanup()
     if should_log_startup:
         logger.info("已注册模拟进程清理函数")
-    
+
+    if should_log_startup and not Config.API_KEYS:
+        logger.warning(
+            "MIROFISH_API_KEYS 未配置：API 认证已禁用，任何人都可以匿名访问所有接口。"
+            "仅适用于本地单用户场景；对外或多用户部署前必须配置该变量。"
+        )
+
+    # 认证中间件：为每个请求解析 API Key 并写入 g.current_user_id，
+    # 供后续基于资源所有权的授权逻辑使用
+    @app.before_request
+    def enforce_authentication():
+        if request.method == 'OPTIONS' or request.path in AUTH_EXEMPT_PATHS:
+            return None
+        try:
+            g.current_user_id = authenticate_request()
+        except AuthenticationError as e:
+            get_logger('mirofish.auth').warning(f"认证失败: {request.method} {request.path}: {e}")
+            return jsonify({"error": "unauthorized", "message": str(e)}), 401
+        return None
+
     # 请求日志中间件
     @app.before_request
     def log_request():
