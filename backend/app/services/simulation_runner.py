@@ -876,17 +876,12 @@ class SimulationRunner:
                     state.error = error_message
                     state.completed_at = datetime.now().isoformat()
                     cls._save_run_state(state)
+                    cls._save_terminal_checkpoint(simulation_id, state)
                     cls._sync_simulation_status(
                         simulation_id,
                         desired_status,
                         error_message,
                     )
-                    try:
-                        simulation_checkpoint.save_checkpoint(
-                            sim_dir, simulation_checkpoint.build_checkpoint_from_state(state)
-                        )
-                    except Exception:
-                        logger.exception(f"保存最终检查点失败: simulation_id={simulation_id}")
                     if desired_status == RunnerStatus.COMPLETED:
                         logger.info(f"模拟完成: {simulation_id}")
                     else:
@@ -911,7 +906,26 @@ class SimulationRunner:
                 except Exception:
                     pass
                 cls._stderr_files.pop(simulation_id, None)
-    
+
+    @classmethod
+    def _save_terminal_checkpoint(cls, simulation_id: str, state: SimulationRunState) -> None:
+        """
+        在运行状态到达终态（COMPLETED/STOPPED/FAILED）时保存最终检查点。
+
+        有两条互不相通的终态路径都需要调用这个方法：_monitor_simulation
+        的收尾（正常场景，有监控线程在跑），以及 stop_simulation 中"没有
+        监控线程时同步完成终态"的分支（例如进程重启后恢复、或测试场景）。
+        只在其中一条路径写检查点会让另一条路径下 GET .../checkpoint
+        继续返回过期的运行中状态。
+        """
+        try:
+            sim_dir = cls._get_sim_dir(simulation_id)
+            simulation_checkpoint.save_checkpoint(
+                sim_dir, simulation_checkpoint.build_checkpoint_from_state(state)
+            )
+        except Exception:
+            logger.exception(f"保存最终检查点失败: simulation_id={simulation_id}")
+
     @classmethod
     def _read_action_log(
         cls, 
@@ -1203,6 +1217,7 @@ class SimulationRunner:
                         state.completed_at = datetime.now().isoformat()
                         state.error = f"Zep图谱写入未完整完成: {error}"
                         cls._save_run_state(state)
+                        cls._save_terminal_checkpoint(simulation_id, state)
                         cls._sync_simulation_status(
                             simulation_id,
                             RunnerStatus.FAILED,
@@ -1215,6 +1230,7 @@ class SimulationRunner:
                 state.completed_at = datetime.now().isoformat()
                 state.error = None
                 cls._save_run_state(state)
+                cls._save_terminal_checkpoint(simulation_id, state)
                 cls._sync_simulation_status(
                     simulation_id,
                     RunnerStatus.STOPPED,
@@ -1524,6 +1540,7 @@ class SimulationRunner:
         - twitter_simulation.db（模拟数据库）
         - reddit_simulation.db（模拟数据库）
         - env_status.json（环境状态）
+        - checkpoint.json（检查点）
         
         注意：不会删除配置文件（simulation_config.json）和 profile 文件
         
@@ -1552,6 +1569,7 @@ class SimulationRunner:
             "twitter_simulation.db",  # Twitter 平台数据库
             "reddit_simulation.db",   # Reddit 平台数据库
             "env_status.json",        # 环境状态文件
+            simulation_checkpoint.CHECKPOINT_FILENAME,  # 检查点，否则强制重启失败时会残留上一轮的进度
         ]
         
         # 要删除的目录列表（包含动作日志）

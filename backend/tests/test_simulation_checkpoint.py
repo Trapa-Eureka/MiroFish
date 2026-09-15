@@ -358,3 +358,64 @@ class TestStartSimulationResetsStaleCheckpoint:
             SimulationRunner._stdout_files.pop(simulation_id, None)
             SimulationRunner._stderr_files.pop(simulation_id, None)
             SimulationRunner._graph_memory_enabled.pop(simulation_id, None)
+
+
+class TestCleanupRemovesCheckpoint:
+    def test_cleanup_simulation_logs_removes_checkpoint_file(self, tmp_path, monkeypatch):
+        simulation_id = "sim_cleanup1234"
+        sim_dir = tmp_path / simulation_id
+        sim_dir.mkdir()
+        save_checkpoint(
+            str(sim_dir),
+            Checkpoint(simulation_id=simulation_id, twitter_round=10, runner_status="failed"),
+        )
+        monkeypatch.setattr(SimulationRunner, "RUN_STATE_DIR", str(tmp_path))
+        monkeypatch.setattr(SimulationRunner, "_run_states", {})
+
+        assert load_checkpoint(str(sim_dir)) is not None
+
+        result = SimulationRunner.cleanup_simulation_logs(simulation_id)
+
+        assert load_checkpoint(str(sim_dir)) is None
+        assert "checkpoint.json" in result["cleaned_files"]
+
+
+class TestStopSimulationWithoutMonitorThreadSavesCheckpoint:
+    """
+    Regression test for Codex's finding: stop_simulation has a synchronous
+    finalization branch used when there is no monitor thread to hand off to
+    (e.g. after a backend restart, where the SimulationRunner process lost
+    its in-memory monitor/process handles but run_state.json says the
+    simulation was still RUNNING). That branch must also persist a final
+    checkpoint, the same as the normal _monitor_simulation finalization path.
+    """
+
+    def test_synchronous_stop_persists_final_checkpoint(self, tmp_path, monkeypatch):
+        simulation_id = "sim_syncstop1234"
+        sim_dir = tmp_path / simulation_id
+
+        state = SimulationRunState(
+            simulation_id=simulation_id,
+            runner_status=RunnerStatus.RUNNING,
+            total_rounds=100,
+            twitter_current_round=17,
+        )
+
+        monkeypatch.setattr(SimulationRunner, "RUN_STATE_DIR", str(tmp_path))
+        monkeypatch.setattr(SimulationRunner, "_run_states", {simulation_id: state})
+        # Simulate "no monitor thread survived a backend restart":
+        monkeypatch.setattr(SimulationRunner, "_processes", {})
+        monkeypatch.setattr(SimulationRunner, "_monitor_threads", {})
+        monkeypatch.setattr(SimulationRunner, "_manual_stop_requests", set())
+        monkeypatch.setattr(SimulationRunner, "_graph_memory_enabled", {})
+        monkeypatch.setattr(
+            SimulationRunner, "_sync_simulation_status", classmethod(lambda *a, **k: None)
+        )
+
+        result = SimulationRunner.stop_simulation(simulation_id)
+
+        assert result.runner_status == RunnerStatus.STOPPED
+        checkpoint = load_checkpoint(str(sim_dir))
+        assert checkpoint is not None
+        assert checkpoint["runner_status"] == "stopped"
+        assert checkpoint["twitter_round"] == 17
