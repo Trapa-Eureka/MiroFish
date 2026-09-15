@@ -347,6 +347,14 @@ class BacktestRunner:
                 甚至提交一次性真实结果的公共资源。project_id 不受此影响，
                 仍然从来源继承，因为它只是描述性的归类信息，不是访问控制。
         """
+        # 把空字符串当作"没提供"——否则 bool("") 判定的"是否提供"和后面
+        # `is not None` 判定的分支走向会不一致：source_simulation_id=""
+        # + source_ensemble_id="ens_x" 会通过这里的互斥校验（因为 bool("")
+        # 是 False），却在下面因为 "" is not None 而走进单次模拟分支，
+        # 去加载一个 id 为空字符串的模拟；反过来 source_ensemble_id="" 会
+        # 被原样存进最终记录里，留下一个看起来"两个来源都填了"的脏数据。
+        source_simulation_id = source_simulation_id or None
+        source_ensemble_id = source_ensemble_id or None
         if bool(source_simulation_id) == bool(source_ensemble_id):
             raise ValueError(
                 "必须且只能提供 source_simulation_id 或 source_ensemble_id 中的一个"
@@ -414,7 +422,17 @@ class BacktestRunner:
         锁：否则两个并发请求都可能在对方写入完成之前读到 ground_truth
         is None，双双通过"是否已登记过"的检查，其中一次会静默覆盖另一次
         本该不可变的结果。
+
+        存在性检查必须在真正拿锁之前先做一次：_backtest_lock 对任何字符串
+        都会用 setdefault 在进程级字典里留下一条记录，如果对不存在（甚至
+        格式非法）的 backtest_id 也无条件先拿锁，调用方只要不断用不同的
+        随机 id 探测这个接口，就能让这个字典无限增长——只有真实存在的
+        backtest_id 才配拥有一把锁。拿到锁之后会重新读一次，防止两次读取
+        之间这个 case 被另一个并发请求打分。
         """
+        if cls.get_backtest(backtest_id) is None:
+            raise ValueError(f"回测不存在: {backtest_id}")
+
         with cls._backtest_lock(backtest_id):
             case = cls.get_backtest(backtest_id)
             if case is None:

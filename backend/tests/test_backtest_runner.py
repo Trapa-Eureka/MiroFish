@@ -132,6 +132,35 @@ class TestCreateBacktestValidation:
                 source_ensemble_id="ens_source1234",
             )
 
+    def test_empty_string_simulation_id_treated_as_absent_uses_ensemble(self):
+        # An empty-string source_simulation_id alongside a real
+        # source_ensemble_id must resolve to "use the ensemble", not be
+        # treated as a present-but-invalid simulation id (which would
+        # incorrectly reject a perfectly valid request).
+        _make_completed_ensemble()
+        case = BacktestRunner.create_backtest(
+            scenario_description="x", t0_cutoff="2024-01-01",
+            prediction={"occurred": True},
+            source_simulation_id="",
+            source_ensemble_id="ens_source1234",
+        )
+        assert case.source_ensemble_id == "ens_source1234"
+        assert case.source_simulation_id is None
+
+    def test_empty_string_ensemble_id_does_not_get_persisted(self):
+        # A real source_simulation_id alongside an empty-string
+        # source_ensemble_id must not leave a stray non-None
+        # source_ensemble_id="" in the persisted record.
+        _make_completed_simulation()
+        case = BacktestRunner.create_backtest(
+            scenario_description="x", t0_cutoff="2024-01-01",
+            prediction={"occurred": True},
+            source_simulation_id="sim_source12345",
+            source_ensemble_id="",
+        )
+        assert case.source_simulation_id == "sim_source12345"
+        assert case.source_ensemble_id is None
+
     def test_missing_scenario_description_rejected(self):
         _make_completed_simulation()
         with pytest.raises(ValueError, match="scenario_description"):
@@ -400,6 +429,28 @@ class TestRecordGroundTruth:
     def test_missing_backtest_rejected(self):
         with pytest.raises(ValueError, match="不存在"):
             BacktestRunner.record_ground_truth("bt_doesnotexist", {"occurred": True})
+
+    def test_probing_nonexistent_ids_does_not_grow_the_lock_registry(self):
+        # Regression test: _backtest_lock's setdefault used to run
+        # unconditionally before existence was checked, so probing
+        # record_ground_truth with N distinct nonexistent ids left N
+        # permanent entries in the process-wide lock dict -- unbounded
+        # memory growth an unauthenticated caller could trigger for free.
+        from app.services.backtest_runner import BacktestRunner as _BR
+
+        _BR._backtest_locks.clear()
+        for i in range(20):
+            with pytest.raises(ValueError, match="不存在"):
+                BacktestRunner.record_ground_truth(f"bt_doesnotexist{i:03d}", {"occurred": True})
+        assert len(_BR._backtest_locks) == 0
+
+    def test_lock_is_still_created_for_a_real_backtest(self):
+        from app.services.backtest_runner import BacktestRunner as _BR
+
+        _BR._backtest_locks.clear()
+        case = self._create_case({"occurred": True})
+        BacktestRunner.record_ground_truth(case.backtest_id, {"occurred": True})
+        assert case.backtest_id in _BR._backtest_locks
 
     def test_recording_twice_rejected(self):
         case = self._create_case({"occurred": True})
