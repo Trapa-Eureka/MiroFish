@@ -365,14 +365,31 @@ class SimulationRunner:
         变成 STARTING/RUNNING，本进程的缓存却还没有任何理由去刷新。
         force_reload=True 会跳过缓存、强制从磁盘重新读取（读到的新值
         仍然会顺带刷新缓存，不会让缓存和磁盘更久地不一致）。
+
+        force_reload 读盘的过程中，本进程自己的另一个线程完全可能正好在
+        这中间完成了一次更新（例如监控线程刚把状态从 RUNNING 推进到
+        COMPLETED，revision 也随之递增，并已经把新状态写回了缓存）——这
+        时磁盘上读到的可能反而是一份更旧的快照。不比较 revision、无条件
+        用读盘结果覆盖缓存的话，会把缓存从"更新的 COMPLETED"倒退回
+        "更旧的 RUNNING"，而且这个回退会一直留在缓存里，让后续所有不带
+        force_reload 的正常调用方（状态轮询、重启校验等）都被这份错误的
+        倒退数据污染，看起来"永远在跑"。因此这里只在读到的 revision 不
+        低于当前缓存时才用它覆盖缓存；否则缓存里更新的那份状态才是权威
+        的，直接把它返回给调用方，而不是返回这份更旧的读数。
         """
         if not force_reload and simulation_id in cls._run_states:
             return cls._run_states[simulation_id]
 
         # 尝试从文件加载
         state = cls._load_run_state(simulation_id)
-        if state:
-            cls._run_states[simulation_id] = state
+        if state is None:
+            return None
+
+        cached = cls._run_states.get(simulation_id)
+        if cached is not None and cached.revision > state.revision:
+            return cached
+
+        cls._run_states[simulation_id] = state
         return state
     
     @classmethod

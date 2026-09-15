@@ -190,6 +190,82 @@ class TestProcessRestartRecovery:
             SimulationRunner._save_run_state(recovered)  # STOPPING -> RUNNING illegal
 
 
+class TestForceReload:
+    def test_force_reload_picks_up_a_newer_on_disk_state(self):
+        # Simulates another process (sharing the uploads directory)
+        # writing a newer state directly to disk without this process's
+        # cache ever being told, the way backtest_runner.py's provenance
+        # checks rely on force_reload to observe.
+        sim_id = "sim_forcereload1"
+        state = _state(sim_id, RunnerStatus.STARTING)
+        SimulationRunner._save_run_state(state)
+        state.runner_status = RunnerStatus.RUNNING
+        SimulationRunner._save_run_state(state)  # cache now holds RUNNING/rev2
+
+        state_path = SimulationRunner._get_sim_dir(sim_id) + "/run_state.json"
+        with open(state_path, "r", encoding="utf-8") as f:
+            on_disk = json.load(f)
+        on_disk["runner_status"] = "completed"
+        on_disk["revision"] = 3
+        with open(state_path, "w", encoding="utf-8") as f:
+            json.dump(on_disk, f)
+
+        assert SimulationRunner.get_run_state(sim_id).runner_status == RunnerStatus.RUNNING
+        reloaded = SimulationRunner.get_run_state(sim_id, force_reload=True)
+        assert reloaded.runner_status == RunnerStatus.COMPLETED
+        assert SimulationRunner.get_run_state(sim_id).runner_status == RunnerStatus.COMPLETED
+
+    def test_force_reload_does_not_regress_a_newer_cached_state(self):
+        # Regression test: force_reload racing a same-process finalizer
+        # must never let an older on-disk read overwrite (or be returned
+        # in place of) a newer state that's already in the cache --
+        # otherwise every subsequent non-force_reload caller in this
+        # process (status polling, restart eligibility, etc.) would be
+        # permanently stuck observing the older status.
+        sim_id = "sim_forcereload2"
+        state = _state(sim_id, RunnerStatus.STARTING)
+        SimulationRunner._save_run_state(state)
+        state.runner_status = RunnerStatus.RUNNING
+        SimulationRunner._save_run_state(state)  # cache: RUNNING/rev2, disk: RUNNING/rev2
+
+        # Simulate get_run_state(force_reload=True) having already read a
+        # stale disk snapshot (RUNNING/rev2) into a local variable, and
+        # THEN -- before it writes that snapshot into the cache -- this
+        # same process's finalizer races ahead and persists COMPLETED/rev3
+        # (updating the cache too, exactly like _save_run_state always
+        # does). We reproduce that ordering directly against the cache
+        # dict rather than the disk file, since disk mtime granularity
+        # can't reliably force a real race window in a fast unit test.
+        stale_read = SimulationRunState(
+            simulation_id=sim_id, runner_status=RunnerStatus.RUNNING, revision=2
+        )
+        state.runner_status = RunnerStatus.STOPPING
+        SimulationRunner._save_run_state(state)
+        state.runner_status = RunnerStatus.STOPPED
+        SimulationRunner._save_run_state(state)  # cache: STOPPED/rev4 (newer than stale_read)
+
+        cached_before = SimulationRunner._run_states[sim_id]
+        assert cached_before.revision == 4
+
+        # Directly exercise the revision-comparison branch get_run_state
+        # applies after loading from disk, using the stale snapshot as
+        # the "disk read" result.
+        import app.services.simulation_runner as runner_module
+
+        original_load = runner_module.SimulationRunner._load_run_state
+        runner_module.SimulationRunner._load_run_state = classmethod(
+            lambda cls, _sim_id: stale_read
+        )
+        try:
+            result = SimulationRunner.get_run_state(sim_id, force_reload=True)
+        finally:
+            runner_module.SimulationRunner._load_run_state = original_load
+
+        assert result.runner_status == RunnerStatus.STOPPED
+        assert result.revision == 4
+        assert SimulationRunner._run_states[sim_id].revision == 4
+
+
 def test_raw_file_contains_expected_shape(tmp_path):
     sim_id = "sim_rawshape1234"
     state = _state(sim_id, RunnerStatus.STARTING)
