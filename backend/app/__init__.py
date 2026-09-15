@@ -17,6 +17,7 @@ from .utils.logger import setup_logger, get_logger
 from .utils.id_validation import InvalidIdentifierError, PathContainmentError
 from .utils.auth import authenticate_request, AuthenticationError
 from .utils.authorization import ForbiddenError
+from .utils.state_machine import ConcurrentModificationError, InvalidStateTransitionError
 
 # /health 不需要认证；其余路径均为 /api/* 蓝图路由
 AUTH_EXEMPT_PATHS = {'/health'}
@@ -116,7 +117,18 @@ def create_app(config_class=Config):
             f"拒绝越权访问: {request.method} {request.path} user={getattr(g, 'current_user_id', None)}"
         )
         return jsonify({"error": "forbidden", "message": str(error)}), 403
-    
+
+    # 统一处理状态机相关冲突，返回 409
+    @app.errorhandler(InvalidStateTransitionError)
+    def handle_invalid_state_transition(error):
+        get_logger('mirofish.request').warning(f"拒绝非法状态转换: {error}")
+        return jsonify({"error": "invalid_state_transition", "message": str(error)}), 409
+
+    @app.errorhandler(ConcurrentModificationError)
+    def handle_concurrent_modification(error):
+        get_logger('mirofish.request').warning(f"检测到并发修改冲突: {error}")
+        return jsonify({"error": "concurrent_modification", "message": str(error)}), 409
+
     if should_log_startup:
         logger.info("MiroFish Backend 启动完成")
     
