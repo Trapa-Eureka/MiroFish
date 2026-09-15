@@ -500,3 +500,82 @@ class TestStartupFailureBeforeMonitorPersistsCheckpoint:
         # the validation must fail before the run is ever claimed.
         assert simulation_id not in SimulationRunner._run_states
         assert load_checkpoint(str(sim_dir)) is None
+
+
+class TestStartSimulationClearsStaleActionLogs:
+    """
+    Regression test for Codex's round-5 finding: this is a pre-existing gap
+    that predates the checkpoint feature -- _monitor_simulation always tails
+    actions.jsonl from position 0, but nothing cleared that file unless the
+    API caller explicitly passed force=True. Restarting a completed/stopped
+    simulation without force left the previous run's actions.jsonl in place,
+    so the new run's monitor would replay old rounds/actions as if they were
+    fresh progress, corrupting both run_state.json and the new checkpoint.
+    Fixed at the SimulationRunner level so it holds regardless of how the
+    caller invokes start_simulation.
+    """
+
+    def test_stale_action_logs_removed_when_claiming_a_new_run(self, tmp_path, monkeypatch):
+        simulation_id = "sim_stalelogs123"
+        sim_dir = tmp_path / "runs" / simulation_id
+        scripts_dir = tmp_path / "scripts"
+        sim_dir.mkdir(parents=True)
+        scripts_dir.mkdir()
+        (sim_dir / "simulation_config.json").write_text(
+            json.dumps({
+                "time_config": {"total_simulation_hours": 1, "minutes_per_round": 60},
+            }),
+            encoding="utf-8",
+        )
+        (scripts_dir / "run_twitter_simulation.py").write_text("pass\n", encoding="utf-8")
+
+        # Leftover action log from a previous, already-finished run.
+        stale_log = sim_dir / "twitter" / "actions.jsonl"
+        stale_log.parent.mkdir(parents=True)
+        stale_log.write_text(
+            json.dumps({"event_type": "round_end", "round": 99, "simulated_hours": 99}) + "\n",
+            encoding="utf-8",
+        )
+
+        class Process:
+            pid = 123
+
+            def poll(self):
+                return None
+
+        class BrokenThread:
+            def __init__(self, **_kwargs):
+                pass
+
+            def start(self):
+                raise RuntimeError("monitor failed")
+
+        monkeypatch.setattr(SimulationRunner, "RUN_STATE_DIR", str(tmp_path / "runs"))
+        monkeypatch.setattr(SimulationRunner, "SCRIPTS_DIR", str(scripts_dir))
+        monkeypatch.setattr(runner_module.subprocess, "Popen", lambda *_a, **_k: Process())
+        monkeypatch.setattr(runner_module.threading, "Thread", BrokenThread)
+        monkeypatch.setattr(
+            SimulationRunner,
+            "_terminate_process",
+            classmethod(lambda _cls, _process, sim_id: None),
+        )
+        monkeypatch.setattr(
+            SimulationRunner, "_sync_simulation_status", classmethod(lambda *a, **k: None)
+        )
+
+        try:
+            with pytest.raises(RuntimeError, match="monitor failed"):
+                SimulationRunner.start_simulation(
+                    simulation_id, platform="twitter", enable_graph_memory_update=False
+                )
+
+            # The stale log must be gone even though startup failed later --
+            # it's cleared at claim time, before any monitor ever runs.
+            assert not stale_log.exists()
+        finally:
+            SimulationRunner._run_states.pop(simulation_id, None)
+            SimulationRunner._processes.pop(simulation_id, None)
+            SimulationRunner._action_queues.pop(simulation_id, None)
+            SimulationRunner._stdout_files.pop(simulation_id, None)
+            SimulationRunner._stderr_files.pop(simulation_id, None)
+            SimulationRunner._graph_memory_enabled.pop(simulation_id, None)

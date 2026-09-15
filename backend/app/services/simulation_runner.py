@@ -541,6 +541,26 @@ class SimulationRunner:
                 raise ValueError(f"模拟已在运行或结束处理中: {simulation_id}")
             cls._save_run_state(state)
 
+            # 清除上一轮运行遗留的动作日志。_monitor_simulation 总是从
+            # position 0 开始读取 actions.jsonl；如果这里不清理，新一轮的
+            # 监控线程会把上一轮已经记录的 round_end/action 当成本轮的进度
+            # 重新处理一遍，导致 run_state.json 和检查点都汇报错误的轮次/
+            # 动作数（这是一个先于本次改动就存在的问题——此前只有在
+            # API 层传入 force=True 时才会清理，未强制重启的路径完全没有
+            # 清理；检查点让这个问题变得更容易被观察到，因此这里一并修复，
+            # 让 SimulationRunner 自身保证每次新认领的运行不会读到旧日志，
+            # 而不是依赖调用方是否传了 force）。
+            for _platform_dir in ("twitter", "reddit"):
+                _stale_log = os.path.join(sim_dir, _platform_dir, "actions.jsonl")
+                if os.path.exists(_stale_log):
+                    try:
+                        os.remove(_stale_log)
+                    except Exception:
+                        logger.exception(
+                            f"清理上一轮动作日志失败: simulation_id={simulation_id}, "
+                            f"file={_stale_log}"
+                        )
+
             # 这里是"新一轮运行已确定接管该 simulation_id"的唯一节点，
             # 覆盖了后续所有可能的启动失败路径（Zep 更新器创建失败、脚本
             # 缺失、进程启动失败等）。此时必须让检查点反映新一轮运行，
