@@ -27,6 +27,18 @@ MiroFish 在这里的角色定位——记账与打分基础设施，不是自�
    策划者的诚实——如实标注 t0_cutoff 只是一个供人核对的说明字段，不是
    一个技术上被强制执行的约束。
 
+   还有一个相关但更技术性的问题：source_simulation_id 是可以被原地
+   重跑复用的（/api/simulation/start 允许对同一个 simulation_id 重新
+   跑一遍，run_state 会被替换）。如果一个 backtest 创建之后，它引用的
+   来源模拟后来被重跑了，这份被锁定的 prediction 名义上还挂在同一个
+   simulation_id 下，但实际支撑它的那次运行已经不是原来那次了——审计
+   链断了。本模块不会、也做不到冻结一份完整的输入快照（那需要连
+   人设/配置/动作日志一起拷贝，超出这个模块的范围），只在创建时记录
+   了来源那次运行的一个可验证时间戳（source_run_snapshot_at：单次模拟
+   用 run_state.started_at，集成用 created_at，因为集成永远不会被原地
+   重跑，每次都是全新的 ensemble_id），供日后人工核对"这个来源是不是
+   还是当初那一次"。
+
 3. 来源必须是一次已经跑到终态并且成功完成的单次模拟（SimulationRunner，
    platform 不限）或一次集成（EnsembleRunner，见 TASK 8），预测的
    probability/distribution 字段（用于 Brier/校准误差/分布距离）通常是
@@ -54,7 +66,6 @@ import json
 import math
 import os
 import statistics
-import threading
 import uuid
 from dataclasses import asdict, dataclass, field
 from datetime import datetime
@@ -143,6 +154,15 @@ class BacktestCase:
     ground_truth_recorded_at: Optional[str] = None
     metrics: Optional[Dict[str, Any]] = None
     owner_id: Optional[str] = None
+    # 来源在创建这个 case 时的一个可验证快照时间戳——单次模拟用它的
+    # run_state.started_at，集成用它的 created_at（集成永远不会被"重启"，
+    # 一次新的集成运行总会拿到一个全新的 ensemble_id，只有模拟可以在原地
+    # 重跑）。不是一份完整的输入快照（那需要连人设/配置/动作日志一起
+    # 拷一份，超出本模块范围），只是让日后审计时能够核对："我现在看到的
+    # source_simulation_id 对应的最新一次运行，是不是就是这份预测当初
+    # 依据的那一次？" ——如果两者的时间戳对不上，说明这个来源后来被重跑
+    # 过，这份预测的可信来源已经变了，需要人工核实。
+    source_run_snapshot_at: Optional[str] = None
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -158,6 +178,7 @@ class BacktestCase:
             "ground_truth_recorded_at": self.ground_truth_recorded_at,
             "metrics": self.metrics,
             "owner_id": self.owner_id,
+            "source_run_snapshot_at": self.source_run_snapshot_at,
         }
 
     @classmethod
@@ -176,6 +197,7 @@ class BacktestCase:
             ground_truth_recorded_at=data.get("ground_truth_recorded_at"),
             metrics=data.get("metrics"),
             owner_id=data.get("owner_id"),
+            source_run_snapshot_at=data.get("source_run_snapshot_at"),
         )
 
 
@@ -258,20 +280,6 @@ class BacktestRunner:
         os.path.dirname(__file__),
         '../../uploads/backtests'
     )
-
-    # 与 EnsembleRunner._ensemble_lock/SimulationRunner._finalization_lock
-    # 同样的模式：每个 backtest_id 一把锁，序列化 record_ground_truth 的
-    # "读取 ground_truth 是否已存在 -> 打分 -> 落盘"整个序列。没有这把锁，
-    # 两个并发的 record_ground_truth 调用可能都在对方写入完成之前读到
-    # ground_truth is None，双双通过"是否已登记过"的检查，其中一次的结果
-    # 会静默覆盖另一次——而这个字段本来被设计成一次性、不可变的证据。
-    _backtest_locks: Dict[str, threading.Lock] = {}
-    _backtest_locks_guard = threading.Lock()
-
-    @classmethod
-    def _backtest_lock(cls, backtest_id: str) -> threading.Lock:
-        with cls._backtest_locks_guard:
-            return cls._backtest_locks.setdefault(backtest_id, threading.Lock())
 
     @classmethod
     def _get_backtest_dir(cls, backtest_id: str) -> str:
@@ -381,6 +389,10 @@ class BacktestRunner:
                     f"来源模拟尚未成功完成，无法作为回测预测依据: {source_simulation_id}"
                 )
             project_id = state.project_id
+            # simulation_id 是可以被原地重跑复用的（同一个 id，新的
+            # run_state），不像 ensemble_id 那样每次都是全新的——记下这次
+            # 用作预测依据的这一次运行的 started_at，供日后审计比对。
+            source_run_snapshot_at = run_state.started_at
         else:
             record = EnsembleRunner.get_ensemble_record(source_ensemble_id)
             if record is None:
@@ -391,6 +403,7 @@ class BacktestRunner:
                     f"来源集成尚未成功完成，无法作为回测预测依据: {source_ensemble_id}"
                 )
             project_id = record.project_id
+            source_run_snapshot_at = record.created_at
 
         backtest_id = f"bt_{uuid.uuid4().hex[:12]}"
         case = BacktestCase(
@@ -403,6 +416,7 @@ class BacktestRunner:
             prediction=parsed_prediction,
             created_at=datetime.now().isoformat(),
             owner_id=owner_id,
+            source_run_snapshot_at=source_run_snapshot_at,
         )
         backtest_dir = cls._get_backtest_dir(backtest_id)
         os.makedirs(backtest_dir, exist_ok=True)
@@ -422,37 +436,57 @@ class BacktestRunner:
         拒绝，而不是覆盖之前的真实结果（防止"看到分数不满意就悄悄改真实
         结果重新打分"）。
 
-        "读取是否已登记 -> 打分 -> 落盘"整个序列持有同一个 backtest_id 的
-        锁：否则两个并发请求都可能在对方写入完成之前读到 ground_truth
-        is None，双双通过"是否已登记过"的检查，其中一次会静默覆盖另一次
-        本该不可变的结果。
+        这个"一次性"保证用一个独占创建的声明文件（O_CREAT|O_EXCL）来
+        实现，而不是 threading.Lock：Lock 只在单个 Python 进程内有效——
+        一旦部署到多进程/多容器（例如 gunicorn --workers > 1）、共享同一个
+        uploads 目录，各个进程各自持有自己的锁字典，互相之间毫无阻挡，
+        两个几乎同时到达不同进程的请求依然能都读到 ground_truth is None、
+        都"成功"，后一次悄悄覆盖前一次本该不可变的结果。而 O_CREAT|O_EXCL
+        创建同一个路径，在同一台机器的多个进程之间也是操作系统保证的原子
+        操作——谁先创建成功，谁就独占了"登记真实结果"这个一次性操作，
+        不依赖任何进程内数据结构。
 
-        存在性检查必须在真正拿锁之前先做一次：_backtest_lock 对任何字符串
-        都会用 setdefault 在进程级字典里留下一条记录，如果对不存在（甚至
-        格式非法）的 backtest_id 也无条件先拿锁，调用方只要不断用不同的
-        随机 id 探测这个接口，就能让这个字典无限增长——只有真实存在的
-        backtest_id 才配拥有一把锁。拿到锁之后会重新读一次，防止两次读取
-        之间这个 case 被另一个并发请求打分。
+        校验（_parse_ground_truth/_ensure_scorable）被安排在声明这个独占
+        权之前完成：这样一次因为输入格式错误而失败的请求不会白白消耗掉
+        这个一次性声明——调用方修正输入后应该还能重试。一旦声明成功，
+        后续任何失败（包括落盘失败）都不会释放这个声明——宁可让这个 case
+        卡在一个需要人工介入的状态，也不要重新打开一个可能导致重复登记
+        的竞争窗口。
         """
-        if cls.get_backtest(backtest_id) is None:
+        case = cls.get_backtest(backtest_id)
+        if case is None:
             raise ValueError(f"回测不存在: {backtest_id}")
+        if case.ground_truth is not None:
+            raise ValueError(f"该回测已经登记过真实结果，不能重复登记: {backtest_id}")
 
-        with cls._backtest_lock(backtest_id):
-            case = cls.get_backtest(backtest_id)
-            if case is None:
-                raise ValueError(f"回测不存在: {backtest_id}")
-            if case.ground_truth is not None:
-                raise ValueError(f"该回测已经登记过真实结果，不能重复登记: {backtest_id}")
+        parsed_ground_truth = cls._parse_ground_truth(ground_truth)
+        cls._ensure_scorable(case.prediction, parsed_ground_truth)
 
-            parsed_ground_truth = cls._parse_ground_truth(ground_truth)
-            cls._ensure_scorable(case.prediction, parsed_ground_truth)
+        claim_path = cls._ground_truth_claim_path(backtest_id)
+        try:
+            claim_fd = os.open(claim_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            os.close(claim_fd)
+        except FileExistsError:
+            raise ValueError(f"该回测已经登记过真实结果，不能重复登记: {backtest_id}")
 
-            case.ground_truth = parsed_ground_truth
-            case.ground_truth_recorded_at = datetime.now().isoformat()
-            case.metrics = cls._score_case(case.prediction, parsed_ground_truth)
+        # 拿到声明之后重新读一次最新状态——防御性检查：理论上声明已经
+        # 保证了独占，这里不应该再看到 ground_truth 已存在，但如果真的
+        # 出现（比如声明文件是上一次崩溃在写入 backtest.json 之前留下的
+        # 残留），情愿诚实报错，也不要在没有真实数据支撑的情况下继续。
+        case = cls.get_backtest(backtest_id)
+        if case is None or case.ground_truth is not None:
+            raise ValueError(f"该回测已经登记过真实结果，不能重复登记: {backtest_id}")
 
-            atomic_write_json(cls._backtest_path(backtest_id), case.to_dict())
-            return case
+        case.ground_truth = parsed_ground_truth
+        case.ground_truth_recorded_at = datetime.now().isoformat()
+        case.metrics = cls._score_case(case.prediction, parsed_ground_truth)
+
+        atomic_write_json(cls._backtest_path(backtest_id), case.to_dict())
+        return case
+
+    @classmethod
+    def _ground_truth_claim_path(cls, backtest_id: str) -> str:
+        return os.path.join(cls._get_backtest_dir(backtest_id), "ground_truth.claim")
 
     @staticmethod
     def _ensure_scorable(prediction: Prediction, ground_truth: GroundTruth) -> None:

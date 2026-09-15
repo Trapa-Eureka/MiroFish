@@ -432,6 +432,37 @@ class TestCreateBacktestHappyPath:
         )
         assert case.owner_id == "alice"
 
+    def test_source_run_snapshot_pins_simulation_started_at(self):
+        _make_completed_simulation()
+        run_state = SimulationRunner.get_run_state("sim_source12345")
+        run_state.started_at = "2024-06-01T12:00:00"
+        SimulationRunner._save_run_state(run_state)
+
+        case = BacktestRunner.create_backtest(
+            scenario_description="x", t0_cutoff="2024-01-01",
+            prediction={"occurred": True},
+            source_simulation_id="sim_source12345",
+        )
+        assert case.source_run_snapshot_at == "2024-06-01T12:00:00"
+
+        # If the source simulation is later rerun (same simulation_id, new
+        # started_at), the pinned snapshot on the already-created backtest
+        # stays frozen at the original value -- the mismatch is exactly
+        # what lets an auditor detect the source has since changed.
+        run_state.started_at = "2024-07-01T00:00:00"
+        SimulationRunner._save_run_state(run_state)
+        reloaded = BacktestRunner.get_backtest(case.backtest_id)
+        assert reloaded.source_run_snapshot_at == "2024-06-01T12:00:00"
+
+    def test_source_run_snapshot_pins_ensemble_created_at(self):
+        record = _make_completed_ensemble()
+        case = BacktestRunner.create_backtest(
+            scenario_description="x", t0_cutoff="2024-01-01",
+            prediction={"occurred": True},
+            source_ensemble_id="ens_source1234",
+        )
+        assert case.source_run_snapshot_at == record.created_at
+
 
 class TestRecordGroundTruth:
     def _create_case(self, prediction):
@@ -446,27 +477,23 @@ class TestRecordGroundTruth:
         with pytest.raises(ValueError, match="不存在"):
             BacktestRunner.record_ground_truth("bt_doesnotexist", {"occurred": True})
 
-    def test_probing_nonexistent_ids_does_not_grow_the_lock_registry(self):
-        # Regression test: _backtest_lock's setdefault used to run
-        # unconditionally before existence was checked, so probing
-        # record_ground_truth with N distinct nonexistent ids left N
-        # permanent entries in the process-wide lock dict -- unbounded
-        # memory growth an unauthenticated caller could trigger for free.
-        from app.services.backtest_runner import BacktestRunner as _BR
-
-        _BR._backtest_locks.clear()
+    def test_probing_nonexistent_ids_creates_no_claim_file_or_directory(self):
+        # Regression test for the original unbounded-growth concern under
+        # the old threading.Lock-based design: existence is checked before
+        # any exclusive-create claim file is touched, so probing with
+        # distinct nonexistent ids leaves nothing behind on disk.
         for i in range(20):
             with pytest.raises(ValueError, match="不存在"):
                 BacktestRunner.record_ground_truth(f"bt_doesnotexist{i:03d}", {"occurred": True})
-        assert len(_BR._backtest_locks) == 0
+        assert not os.path.exists(BacktestRunner.BACKTEST_DATA_DIR) or not os.listdir(
+            BacktestRunner.BACKTEST_DATA_DIR
+        )
 
-    def test_lock_is_still_created_for_a_real_backtest(self):
-        from app.services.backtest_runner import BacktestRunner as _BR
-
-        _BR._backtest_locks.clear()
+    def test_recording_creates_a_claim_file_for_cross_process_exclusion(self):
         case = self._create_case({"occurred": True})
         BacktestRunner.record_ground_truth(case.backtest_id, {"occurred": True})
-        assert case.backtest_id in _BR._backtest_locks
+        claim_path = BacktestRunner._ground_truth_claim_path(case.backtest_id)
+        assert os.path.exists(claim_path)
 
     def test_recording_twice_rejected(self):
         case = self._create_case({"occurred": True})
@@ -478,6 +505,19 @@ class TestRecordGroundTruth:
         case = self._create_case({"direction": "up"})
         with pytest.raises(ValueError, match="没有任何可比较"):
             BacktestRunner.record_ground_truth(case.backtest_id, {"sentiment": "positive"})
+
+    def test_validation_failure_does_not_consume_the_one_shot_claim(self):
+        # Input validation (_parse_ground_truth/_ensure_scorable) happens
+        # before the exclusive claim file is created, specifically so a
+        # single malformed/mismatched request can't permanently brick a
+        # case's ability to ever record ground truth. A bad first attempt
+        # must still allow a valid follow-up to succeed.
+        case = self._create_case({"occurred": True})
+        with pytest.raises(ValueError, match="没有任何可比较"):
+            BacktestRunner.record_ground_truth(case.backtest_id, {"sentiment": "positive"})
+
+        result = BacktestRunner.record_ground_truth(case.backtest_id, {"occurred": True})
+        assert result.metrics["event_occurrence_correct"] is True
 
     def test_rank_only_overlap_is_scorable(self):
         # rank has no per-case metric of its own (it only feeds suite-level
@@ -497,14 +537,14 @@ class TestRecordGroundTruth:
         assert reloaded.metrics is not None
 
     def test_concurrent_record_calls_never_both_succeed(self, monkeypatch):
-        # Regression test for the read-check-write race: without the
-        # per-backtest_id lock, two concurrent calls could both read
-        # ground_truth is None before either write landed, and both
-        # "succeed" -- the second one silently clobbering the supposedly
-        # immutable first result. Widen the race window around the write
-        # itself so two real threads reliably interleave there.
+        # Regression test for the read-check-write race, now guarded by an
+        # O_CREAT|O_EXCL claim file instead of a threading.Lock (which only
+        # ever protected a single process -- see the module docstring and
+        # record_ground_truth's own docstring for why that wasn't enough).
+        # Widen the window between t1 claiming and t1 actually writing the
+        # scored result, so t2's concurrent attempt reliably lands while
+        # t1's claim already exists but its write hasn't landed yet.
         import threading
-        import time
         from app.services import backtest_runner as backtest_runner_module
 
         case = self._create_case({"occurred": True})
@@ -535,18 +575,15 @@ class TestRecordGroundTruth:
 
         t1 = threading.Thread(target=submit, args=(True, "first"))
         t1.start()
-        assert entered_write.wait(timeout=5)  # t1 is now inside the lock, mid-write
+        assert entered_write.wait(timeout=5)  # t1 already holds the claim, mid-write
 
         t2 = threading.Thread(target=submit, args=(False, "second"))
         t2.start()
-        # t2 must block on the lock (held by t1) rather than proceeding to
-        # read ground_truth as None concurrently.
-        time.sleep(0.2)
-        assert t2.is_alive()
+        t2.join(timeout=5)  # t2's os.open(O_EXCL) fails fast -- no blocking involved
+        assert not t2.is_alive()
 
         release_write.set()
         t1.join(timeout=5)
-        t2.join(timeout=5)
 
         outcomes = list(results.values())
         successes = [r for r in outcomes if isinstance(r, BacktestCase)]
