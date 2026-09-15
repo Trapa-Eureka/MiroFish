@@ -648,3 +648,59 @@ class TestStartSimulationClearsStaleActionLogs:
         finally:
             SimulationRunner._run_states.pop(simulation_id, None)
             SimulationRunner._graph_memory_enabled.pop(simulation_id, None)
+
+
+class TestStartFailsClosedWhenCheckpointResetFails:
+    """
+    Regression test for Codex's round-7 finding, symmetric to round 6 but
+    for the checkpoint reset write itself rather than the stale-log cleanup:
+    if save_checkpoint() raises while resetting the checkpoint for a new
+    run, start_simulation must not silently continue and launch a monitor
+    against run_state.json that says STARTING while checkpoint.json still
+    (or now permanently) describes an unrelated previous run.
+    """
+
+    def test_start_fails_closed_if_checkpoint_reset_write_fails(self, tmp_path, monkeypatch):
+        simulation_id = "sim_ckptfail1234"
+        sim_dir = tmp_path / "runs" / simulation_id
+        scripts_dir = tmp_path / "scripts"
+        sim_dir.mkdir(parents=True)
+        scripts_dir.mkdir()
+        (sim_dir / "simulation_config.json").write_text(
+            json.dumps({
+                "time_config": {"total_simulation_hours": 1, "minutes_per_round": 60},
+            }),
+            encoding="utf-8",
+        )
+        (scripts_dir / "run_twitter_simulation.py").write_text("pass\n", encoding="utf-8")
+
+        monkeypatch.setattr(SimulationRunner, "RUN_STATE_DIR", str(tmp_path / "runs"))
+        monkeypatch.setattr(SimulationRunner, "SCRIPTS_DIR", str(scripts_dir))
+        monkeypatch.setattr(
+            SimulationRunner, "_sync_simulation_status", classmethod(lambda *a, **k: None)
+        )
+
+        popen_called = []
+        monkeypatch.setattr(
+            runner_module.subprocess,
+            "Popen",
+            lambda *a, **k: popen_called.append(1) or pytest.fail("must not spawn a process"),
+        )
+        monkeypatch.setattr(
+            runner_module.simulation_checkpoint,
+            "save_checkpoint",
+            lambda *a, **k: (_ for _ in ()).throw(OSError("simulated disk full")),
+        )
+
+        try:
+            with pytest.raises(RuntimeError, match="重置检查点失败"):
+                SimulationRunner.start_simulation(
+                    simulation_id, platform="twitter", enable_graph_memory_update=False
+                )
+
+            assert popen_called == []
+            state = SimulationRunner._run_states[simulation_id]
+            assert state.runner_status == RunnerStatus.FAILED
+        finally:
+            SimulationRunner._run_states.pop(simulation_id, None)
+            SimulationRunner._graph_memory_enabled.pop(simulation_id, None)

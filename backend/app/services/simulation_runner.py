@@ -583,12 +583,28 @@ class SimulationRunner:
             # 覆盖了后续所有可能的启动失败路径（Zep 更新器创建失败、脚本
             # 缺失、进程启动失败等）。此时必须让检查点反映新一轮运行，
             # 而不是让 API 继续返回上一轮运行遗留的旧检查点。
+            #
+            # 与上面清理旧动作日志同理：如果这次重置写入失败（例如磁盘已满），
+            # 不能静默放行——那样 GET .../checkpoint 会在整个新一轮运行期间
+            # 都汇报上一轮遗留的、完全不相关的进度和状态。宁可让启动失败。
             try:
                 simulation_checkpoint.save_checkpoint(
                     sim_dir, simulation_checkpoint.build_checkpoint_from_state(state)
                 )
-            except Exception:
+            except Exception as checkpoint_reset_error:
                 logger.exception(f"重置检查点失败: simulation_id={simulation_id}")
+                state.runner_status = RunnerStatus.FAILED
+                state.error = f"重置检查点失败，拒绝启动新一轮运行: {checkpoint_reset_error}"
+                cls._save_run_state(state)
+                # 尽力重试一次（内部已自行吞掉异常）；即使这次也失败，
+                # run_state.json 的 FAILED 仍是权威状态。
+                cls._save_terminal_checkpoint(simulation_id, state)
+                cls._sync_simulation_status(
+                    simulation_id,
+                    RunnerStatus.FAILED,
+                    state.error,
+                )
+                raise RuntimeError(state.error) from checkpoint_reset_error
         
         # 如果启用图谱记忆更新，创建更新器（graph_id 已在方法开头校验过）
         if enable_graph_memory_update:
