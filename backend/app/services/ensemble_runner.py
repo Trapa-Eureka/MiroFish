@@ -241,6 +241,20 @@ class EnsembleRunner:
         resolved_platform = platform or source_state.get_default_platform()
         if resolved_platform not in ("twitter", "reddit", "parallel"):
             raise ValueError(f"不支持的平台: {resolved_platform}")
+        # 请求的 platform 必须是来源模拟真正准备过人设的平台，否则拷贝到
+        # 成员目录的输入文件里会缺少该平台的 profiles，对应的运行脚本会在
+        # 找不到 profile 文件时直接以退出码 0 正常结束——这会被误判为一次
+        # "正常完成但没有任何动作"的运行，污染聚合统计而不是暴露成配置错误。
+        if resolved_platform in ("twitter", "parallel") and not source_state.enable_twitter:
+            raise ValueError(
+                f"来源模拟未启用 Twitter，无法以 platform={resolved_platform} 启动集成: "
+                f"{source_simulation_id}"
+            )
+        if resolved_platform in ("reddit", "parallel") and not source_state.enable_reddit:
+            raise ValueError(
+                f"来源模拟未启用 Reddit，无法以 platform={resolved_platform} 启动集成: "
+                f"{source_simulation_id}"
+            )
 
         ensemble_id = f"ens_{uuid.uuid4().hex[:12]}"
         ensemble_dir = cls._get_ensemble_dir(ensemble_id)
@@ -253,6 +267,30 @@ class EnsembleRunner:
             files_to_copy.append("reddit_profiles.json")
         if source_state.enable_twitter:
             files_to_copy.append("twitter_profiles.csv")
+
+        # 先以“成员列表已确定、尚未启动”的状态落盘一份临时记录：member_id
+        # 是从 ensemble_id + index 确定性推导出来的，不需要等任何一个
+        # start_simulation 调用返回就能确定完整列表。这样即使worker在下面
+        # 的启动循环中途崩溃，或者循环结束后的最终写入本身失败，集成也已经
+        # 是可被 /list、summary、/stop 发现的——不会出现"若干模拟子进程已经
+        # 在跑，但没有任何集成记录知道它们存在"的情况。
+        provisional_members = [
+            EnsembleMemberRecord(simulation_id=f"{ensemble_id}_m{index}", index=index)
+            for index in range(run_count)
+        ]
+        provisional_record = EnsembleRecord(
+            ensemble_id=ensemble_id,
+            source_simulation_id=source_simulation_id,
+            project_id=source_state.project_id,
+            graph_id=source_state.graph_id,
+            platform=resolved_platform,
+            max_rounds=max_rounds,
+            run_count=run_count,
+            members=provisional_members,
+            created_at=datetime.now().isoformat(),
+            owner_id=source_state.owner_id,
+        )
+        atomic_write_json(cls._ensemble_path(ensemble_id), provisional_record.to_dict())
 
         members: List[EnsembleMemberRecord] = []
         for index in range(run_count):
@@ -300,6 +338,12 @@ class EnsembleRunner:
                     max_rounds=max_rounds,
                     enable_graph_memory_update=False,
                     graph_id=None,
+                    # 集成成员没有人工操作者去调用 interview/close：不传
+                    # no_wait 的话，子进程会在跑完所有轮次后停留在等待
+                    # 命令的状态，SimulationRunner 永远看不到进程退出，
+                    # 这个成员也就永远不会变成 COMPLETED，集成也就永远
+                    # 凑不齐聚合所需的终态成员。
+                    no_wait=True,
                 )
             except Exception as error:
                 logger.exception(
@@ -322,10 +366,23 @@ class EnsembleRunner:
             max_rounds=max_rounds,
             run_count=run_count,
             members=members,
-            created_at=datetime.now().isoformat(),
+            created_at=provisional_record.created_at,
             owner_id=source_state.owner_id,
         )
-        atomic_write_json(cls._ensemble_path(ensemble_id), record.to_dict())
+        try:
+            atomic_write_json(cls._ensemble_path(ensemble_id), record.to_dict())
+        except Exception:
+            # 最终这份带有各成员 start_error 详情的记录写入失败了，但成员
+            # 已经在跑（或已经失败）——上面的临时记录已经让这个集成对
+            # /list、summary、/stop 可见，只是 start_error 字段会暂时停留
+            # 在"未知"（run_state 不存在时，summary 会把它当作 starting
+            # 处理）。这里选择不回滚/终止已经启动的成员：它们是真实、可能
+            # 已产生 LLM 调用成本的进程，"记录写入失败"不应该反过来杀掉
+            # 已经在花钱运行的模拟。
+            logger.exception(
+                f"写入集成最终记录失败（成员已启动，临时记录仍然可见）: "
+                f"ensemble_id={ensemble_id}"
+            )
 
         if all(m.start_error is not None for m in members):
             logger.error(

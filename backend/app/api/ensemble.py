@@ -12,7 +12,7 @@ from flask import request, jsonify
 from . import ensemble_bp
 from ..services.ensemble_runner import EnsembleRunner
 from ..services.simulation_manager import SimulationManager
-from ..utils.authorization import authorize
+from ..utils.authorization import authorize, ForbiddenError
 from ..utils.logger import get_logger
 
 logger = get_logger('mirofish.api.ensemble')
@@ -118,6 +118,11 @@ def start_ensemble():
             "error": str(e),
         }), 400
 
+    except ForbiddenError:
+        # 交给 app.__init__ 里注册的全局 ForbiddenError 处理器返回 403，
+        # 而不是被下面的通用 Exception 分支吞成一个带 traceback 的 500。
+        raise
+
     except Exception as e:
         logger.error(f"启动集成模拟失败: {str(e)}")
         return jsonify({
@@ -147,6 +152,8 @@ def get_ensemble(ensemble_id: str):
             "success": False,
             "error": str(e),
         }), 404
+    except ForbiddenError:
+        raise
     except Exception as e:
         logger.error(f"获取集成状态失败: {str(e)}")
         return jsonify({
@@ -201,6 +208,8 @@ def stop_ensemble():
             "success": False,
             "error": str(e),
         }), 404
+    except ForbiddenError:
+        raise
     except Exception as e:
         logger.error(f"停止集成模拟失败: {str(e)}")
         return jsonify({

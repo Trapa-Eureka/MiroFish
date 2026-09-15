@@ -17,6 +17,7 @@ import os
 
 import pytest
 
+from app.services import ensemble_runner as ensemble_runner_module
 from app.services.ensemble_runner import (
     MAX_ENSEMBLE_RUN_COUNT,
     MIN_ENSEMBLE_RUN_COUNT,
@@ -247,6 +248,133 @@ class TestPartialMemberStartFailure:
         assert summary["member_counts"]["failed"] == 1
         assert summary["member_counts"]["running"] == 2
         assert summary["aggregate"] is None
+
+
+class TestEnsembleMembersRunNonInteractively:
+    def test_members_are_started_with_no_wait(self, monkeypatch):
+        # Ensemble members have no human operator to send interview/close
+        # commands; without --no-wait the child process would sit in the
+        # post-rounds command loop forever and the member would never reach
+        # COMPLETED, so the ensemble could never aggregate.
+        _make_source_simulation()
+
+        captured_cmds = []
+        real_popen = runner_module.subprocess.Popen
+
+        def capturing_popen(cmd, *args, **kwargs):
+            captured_cmds.append(cmd)
+            return FakeProcess()
+
+        monkeypatch.setattr(runner_module.subprocess, "Popen", capturing_popen)
+
+        EnsembleRunner.start_ensemble("sim_source12345", run_count=2)
+
+        assert len(captured_cmds) == 2
+        assert all("--no-wait" in cmd for cmd in captured_cmds)
+
+
+class TestEnsemblePlatformMustMatchPreparedProfiles:
+    def test_twitter_platform_rejected_when_source_has_no_twitter_profiles(self):
+        _make_source_simulation(enable_reddit=True, enable_twitter=False)
+        with pytest.raises(ValueError, match="Twitter"):
+            EnsembleRunner.start_ensemble(
+                "sim_source12345", run_count=2, platform="twitter"
+            )
+
+    def test_reddit_platform_rejected_when_source_has_no_reddit_profiles(self):
+        _make_source_simulation(
+            simulation_id="sim_tw_only1234", enable_reddit=False, enable_twitter=True
+        )
+        with pytest.raises(ValueError, match="Reddit"):
+            EnsembleRunner.start_ensemble(
+                "sim_tw_only1234", run_count=2, platform="reddit"
+            )
+
+    def test_parallel_platform_rejected_when_source_is_single_platform(self):
+        _make_source_simulation(enable_reddit=True, enable_twitter=False)
+        with pytest.raises(ValueError, match="Twitter"):
+            EnsembleRunner.start_ensemble(
+                "sim_source12345", run_count=2, platform="parallel"
+            )
+
+    def test_matching_platform_is_accepted(self):
+        _make_source_simulation(enable_reddit=True, enable_twitter=False)
+        record = EnsembleRunner.start_ensemble(
+            "sim_source12345", run_count=2, platform="reddit"
+        )
+        assert record.platform == "reddit"
+
+
+class TestEnsembleRecordPersistedBeforeMembersLaunch:
+    def test_ensemble_is_discoverable_even_if_launch_loop_never_completes(self, monkeypatch):
+        # Simulate a crash partway through the launch loop (e.g. the process
+        # is killed after member 0 starts but before member 1 is attempted).
+        # The provisional record written before the loop must already make
+        # the ensemble (and its deterministic member ids) discoverable, so a
+        # crash never leaves orphaned simulation subprocesses with no
+        # ensemble record pointing at them.
+        _make_source_simulation()
+
+        original_start = SimulationRunner.start_simulation
+        call_count = {"n": 0}
+
+        def crash_after_first_member(*args, **kwargs):
+            call_count["n"] += 1
+            if call_count["n"] == 2:
+                raise KeyboardInterrupt("simulated worker crash mid-loop")
+            return original_start(*args, **kwargs)
+
+        monkeypatch.setattr(
+            SimulationRunner, "start_simulation", classmethod(
+                lambda cls, *a, **k: crash_after_first_member(*a, **k)
+            )
+        )
+
+        captured_ensemble_id = {}
+        real_write = ensemble_runner_module.atomic_write_json
+
+        def spying_write(path, data):
+            if "ensemble_id" in data and data.get("members"):
+                captured_ensemble_id["id"] = data["ensemble_id"]
+            real_write(path, data)
+
+        monkeypatch.setattr(ensemble_runner_module, "atomic_write_json", spying_write)
+
+        with pytest.raises(KeyboardInterrupt):
+            EnsembleRunner.start_ensemble("sim_source12345", run_count=3)
+
+        ensemble_id = captured_ensemble_id["id"]
+        reloaded = EnsembleRunner.get_ensemble_record(ensemble_id)
+        assert reloaded is not None
+        assert len(reloaded.members) == 3  # full deterministic member list, not just member 0
+
+    def test_final_write_failure_does_not_abort_already_started_members(self, monkeypatch):
+        # If the final (detailed start_error) write fails, already-launched
+        # member processes must not be torn down just because bookkeeping
+        # failed — they are real, possibly-costly running simulations.
+        _make_source_simulation()
+
+        real_write = ensemble_runner_module.atomic_write_json
+        write_count = {"n": 0}
+
+        def flaky_final_write(path, data):
+            write_count["n"] += 1
+            if write_count["n"] == 2:  # first call is the provisional write
+                raise OSError("simulated disk failure on final write")
+            real_write(path, data)
+
+        monkeypatch.setattr(ensemble_runner_module, "atomic_write_json", flaky_final_write)
+
+        record = EnsembleRunner.start_ensemble("sim_source12345", run_count=2)
+
+        for member in record.members:
+            run_state = SimulationRunner.get_run_state(member.simulation_id)
+            assert run_state is not None
+            assert run_state.runner_status == RunnerStatus.RUNNING
+
+        reloaded = EnsembleRunner.get_ensemble_record(record.ensemble_id)
+        assert reloaded is not None
+        assert len(reloaded.members) == 2
 
 
 def _complete_member(member_id, twitter_actions=0, reddit_actions=0, rounds_reached=0):

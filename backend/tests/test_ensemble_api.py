@@ -102,6 +102,20 @@ def client():
     return app.test_client()
 
 
+@pytest.fixture
+def two_user_client(monkeypatch):
+    from app.config import Config
+
+    monkeypatch.setattr(Config, "API_KEYS", {"alice-key": "alice", "bob-key": "bob"})
+    app = create_app()
+    app.config.update(TESTING=True)
+    return app.test_client()
+
+
+def _auth(user_key):
+    return {"Authorization": f"Bearer {user_key}-key"}
+
+
 class TestStartEnsembleRoute:
     def test_start_requires_source_simulation_id(self, client):
         response = client.post("/api/ensemble/start", json={"run_count": 3})
@@ -210,3 +224,52 @@ class TestStopEnsembleRoute:
         response = client.post("/api/ensemble/stop", json={"ensemble_id": ensemble_id})
         assert response.status_code == 200
         assert len(response.json["data"]["results"]) == 2
+
+
+class TestEnsembleRouteForbiddenErrorReturns403:
+    """
+    ForbiddenError must reach the app's global @app.errorhandler(ForbiddenError)
+    (-> 403) instead of being caught by each route's broad `except Exception`
+    (which would turn it into a 500 with a leaked traceback). Uses
+    two_user_client so authorize() actually raises instead of the no-API-keys
+    fail-open path the other tests in this file rely on.
+    """
+
+    def test_start_with_another_users_source_returns_403(self, two_user_client):
+        _make_source_simulation(owner_id="alice")
+        response = two_user_client.post(
+            "/api/ensemble/start",
+            json={"source_simulation_id": "sim_source12345", "run_count": 2},
+            headers=_auth("bob"),
+        )
+        assert response.status_code == 403
+
+    def test_get_another_users_ensemble_returns_403(self, two_user_client):
+        _make_source_simulation(owner_id="alice")
+        start_response = two_user_client.post(
+            "/api/ensemble/start",
+            json={"source_simulation_id": "sim_source12345", "run_count": 2},
+            headers=_auth("alice"),
+        )
+        ensemble_id = start_response.json["data"]["ensemble_id"]
+
+        response = two_user_client.get(
+            f"/api/ensemble/{ensemble_id}", headers=_auth("bob")
+        )
+        assert response.status_code == 403
+
+    def test_stop_another_users_ensemble_returns_403(self, two_user_client):
+        _make_source_simulation(owner_id="alice")
+        start_response = two_user_client.post(
+            "/api/ensemble/start",
+            json={"source_simulation_id": "sim_source12345", "run_count": 2},
+            headers=_auth("alice"),
+        )
+        ensemble_id = start_response.json["data"]["ensemble_id"]
+
+        response = two_user_client.post(
+            "/api/ensemble/stop",
+            json={"ensemble_id": ensemble_id},
+            headers=_auth("bob"),
+        )
+        assert response.status_code == 403
