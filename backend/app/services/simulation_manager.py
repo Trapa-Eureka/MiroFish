@@ -6,6 +6,7 @@ OASIS模拟管理器
 
 import os
 import json
+import secrets
 import shutil
 from typing import Dict, Any, List, Optional
 from dataclasses import dataclass, field
@@ -27,6 +28,7 @@ from ..utils.state_machine import (
 from .zep_entity_reader import ZepEntityReader, FilteredEntities
 from .oasis_profile_generator import OasisProfileGenerator, OasisAgentProfile
 from .simulation_config_generator import SimulationConfigGenerator, SimulationParameters
+from . import reproducibility_manifest
 from ..utils.locale import t
 
 logger = get_logger('mirofish.simulation')
@@ -93,6 +95,10 @@ class SimulationState:
     # 持久化修订号，每次成功保存自增，用于乐观并发控制（CAS）
     revision: int = 0
 
+    # 随机种子：创建时生成，用于在 prepare 阶段控制 MiroFish 自身的非 LLM
+    # 随机性（详见 reproducibility_manifest.py 中 RandomnessInfo 的说明）
+    random_seed: Optional[int] = None
+
     def to_dict(self) -> Dict[str, Any]:
         """完整状态字典（内部使用）"""
         return {
@@ -116,8 +122,9 @@ class SimulationState:
             "error": self.error,
             "owner_id": self.owner_id,
             "revision": self.revision,
+            "random_seed": self.random_seed,
         }
-    
+
     def get_default_platform(self) -> str:
         """根据启用状态返回默认平台"""
         if self.enable_twitter and self.enable_reddit:
@@ -251,6 +258,7 @@ class SimulationManager:
             error=data.get("error"),
             owner_id=data.get("owner_id"),
             revision=data.get("revision", 0),
+            random_seed=data.get("random_seed"),
         )
         
         self._simulations[simulation_id] = state
@@ -288,6 +296,7 @@ class SimulationManager:
             enable_reddit=enable_reddit,
             status=SimulationStatus.CREATED,
             owner_id=owner_id,
+            random_seed=secrets.randbits(32),
         )
         
         self._save_simulation_state(state)
@@ -330,7 +339,12 @@ class SimulationManager:
         state = self._load_simulation_state(simulation_id)
         if not state:
             raise ValueError(f"模拟不存在: {simulation_id}")
-        
+
+        # 兼容在引入 random_seed 字段之前创建的模拟：补发一个种子，
+        # 使其也能获得可复现、可在清单中记录的随机性。
+        if state.random_seed is None:
+            state.random_seed = secrets.randbits(32)
+
         try:
             state.status = SimulationStatus.PREPARING
             state.error = None
@@ -338,9 +352,19 @@ class SimulationManager:
             state.config_generated = False
             state.config_reasoning = ""
             self._save_simulation_state(state)
-            
+
             sim_dir = self._get_simulation_dir(simulation_id)
-            
+
+            # 清除上一次准备遗留的可复现性清单。如果这次准备中途失败，
+            # 不应该让 GET /manifest 继续返回一份描述"上一次成功准备"的
+            # 旧清单，让调用方误以为它描述的是当前（可能已失败/不一致）的状态。
+            try:
+                old_manifest_path = reproducibility_manifest.manifest_path(sim_dir)
+                if os.path.exists(old_manifest_path):
+                    os.remove(old_manifest_path)
+            except Exception:
+                logger.exception(f"清除旧的可复现性清单失败: simulation_id={simulation_id}")
+
             # ========== 阶段1: 读取并过滤实体 ==========
             if progress_callback:
                 progress_callback("reading", 0, t('progress.connectingZepGraph'))
@@ -384,8 +408,14 @@ class SimulationManager:
                     total=total_entities
                 )
             
+            # 传入该模拟的随机种子，用于让 Profile 生成过程中的兜底随机默认值
+            # （karma/年龄/性别/MBTI等）可复现。OasisProfileGenerator 内部为
+            # 每个实体构造独立的 random.Random 实例，而不是重新播种进程全局
+            # 的 random 模块——后者会在多个模拟并行准备（各自的线程池中）时
+            # 相互踩踏彼此的随机序列。不影响 LLM 采样本身的确定性，详见
+            # reproducibility_manifest.py 中 RandomnessInfo 的说明。
             # 传入graph_id以启用Zep检索功能，获取更丰富的上下文
-            generator = OasisProfileGenerator(graph_id=state.graph_id)
+            generator = OasisProfileGenerator(graph_id=state.graph_id, random_seed=state.random_seed)
             
             def profile_progress(current, total, msg):
                 if progress_callback:
@@ -500,7 +530,7 @@ class SimulationManager:
             
             state.config_generated = True
             state.config_reasoning = sim_params.generation_reasoning
-            
+
             if progress_callback:
                 progress_callback(
                     "generating_config", 100,
@@ -508,10 +538,26 @@ class SimulationManager:
                     current=3,
                     total=3
                 )
-            
+
+            # 生成并持久化可复现性清单（记录模型/哈希/版本/种子等）。
+            # 这是产物记录，不是准备流程的关键路径——失败不应阻断模拟准备完成。
+            try:
+                from ..models.project import ProjectManager
+                project = ProjectManager.get_project(state.project_id)
+                manifest = reproducibility_manifest.build_manifest(
+                    state=state,
+                    sim_dir=sim_dir,
+                    project=project,
+                    sim_params=sim_params,
+                    document_text=document_text,
+                )
+                reproducibility_manifest.save_manifest(sim_dir, manifest)
+            except Exception:
+                logger.exception(f"生成可复现性清单失败: simulation_id={simulation_id}")
+
             # 注意：运行脚本保留在 backend/scripts/ 目录，不再复制到模拟目录
             # 启动模拟时，simulation_runner 会从 scripts/ 目录运行脚本
-            
+
             # 更新状态
             state.status = SimulationStatus.READY
             self._save_simulation_state(state)

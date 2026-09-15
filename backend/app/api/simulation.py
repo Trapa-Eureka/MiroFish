@@ -1376,6 +1376,44 @@ def get_simulation_config(simulation_id: str):
         }), 500
 
 
+@simulation_bp.route('/<simulation_id>/manifest', methods=['GET'])
+def get_simulation_manifest(simulation_id: str):
+    """
+    获取模拟的可复现性清单（Reproducibility Manifest）
+
+    记录该模拟准备时使用的 LLM 模型、源文档/本体/生成的 Agent Profile 的
+    内容哈希、随机种子、以及运行时代码/依赖版本，用于事后重建或对比一次
+    运行的执行条件。注意：这不代表整个模拟是完全确定性的，详见清单中
+    `randomness` 字段的说明。
+    """
+    _authorize_simulation_access(simulation_id)
+    try:
+        from ..services import reproducibility_manifest
+
+        manager = SimulationManager()
+        sim_dir = manager._get_simulation_dir(simulation_id)
+        manifest = reproducibility_manifest.load_manifest(sim_dir)
+
+        if not manifest:
+            return jsonify({
+                "success": False,
+                "error": t('api.manifestNotFound')
+            }), 404
+
+        return jsonify({
+            "success": True,
+            "data": manifest
+        })
+
+    except Exception as e:
+        logger.error(f"获取可复现性清单失败: {str(e)}")
+        return jsonify({
+            "success": False,
+            "error": str(e),
+            "traceback": traceback.format_exc()
+        }), 500
+
+
 @simulation_bp.route('/<simulation_id>/config/download', methods=['GET'])
 def download_simulation_config(simulation_id: str):
     """下载模拟配置文件"""
