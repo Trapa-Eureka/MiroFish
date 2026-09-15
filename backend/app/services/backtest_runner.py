@@ -347,15 +347,19 @@ class BacktestRunner:
                 甚至提交一次性真实结果的公共资源。project_id 不受此影响，
                 仍然从来源继承，因为它只是描述性的归类信息，不是访问控制。
         """
-        # 把空字符串当作"没提供"——否则 bool("") 判定的"是否提供"和后面
-        # `is not None` 判定的分支走向会不一致：source_simulation_id=""
-        # + source_ensemble_id="ens_x" 会通过这里的互斥校验（因为 bool("")
-        # 是 False），却在下面因为 "" is not None 而走进单次模拟分支，
-        # 去加载一个 id 为空字符串的模拟；反过来 source_ensemble_id="" 会
-        # 被原样存进最终记录里，留下一个看起来"两个来源都填了"的脏数据。
-        source_simulation_id = source_simulation_id or None
-        source_ensemble_id = source_ensemble_id or None
-        if bool(source_simulation_id) == bool(source_ensemble_id):
+        # 只把字面上的空字符串当作"没提供"再归一化成 None，而不是用
+        # `x or None`——后者会把任何 falsy 值（0、False、[] 这类明显不是
+        # 合法 id、本该被下面的身份校验拒绝的畸形输入）也一并抹成 None。
+        if source_simulation_id == "":
+            source_simulation_id = None
+        if source_ensemble_id == "":
+            source_ensemble_id = None
+        # 互斥校验和下面的分支选择必须用同一套"是否提供"的判定标准——都是
+        # `is not None`，而不是 bool(...)。否则像 0/False/[] 这类
+        # is-not-None 为真但 bool(...) 为假的畸形取值，会在这里被误判为
+        # "没提供"从而放行一个实际上传了两个来源的请求，下面的分支却又
+        # 按 `is not None` 把它当成"提供了"走进对应分支，两处判断不一致。
+        if (source_simulation_id is not None) == (source_ensemble_id is not None):
             raise ValueError(
                 "必须且只能提供 source_simulation_id 或 source_ensemble_id 中的一个"
             )

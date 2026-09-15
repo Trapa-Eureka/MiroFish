@@ -161,6 +161,22 @@ class TestCreateBacktestValidation:
         assert case.source_simulation_id == "sim_source12345"
         assert case.source_ensemble_id is None
 
+    def test_non_string_falsy_source_id_is_rejected_not_silently_absent(self):
+        # Only the literal "" is normalized to "not provided". Other falsy
+        # values (0, False, []) are not valid ids and must not be erased by
+        # normalization -- they should still cause a rejection (whether via
+        # the exclusive-source check or downstream identifier validation),
+        # not be silently treated as "absent" and let a malformed request
+        # through.
+        _make_completed_ensemble()
+        with pytest.raises(ValueError):
+            BacktestRunner.create_backtest(
+                scenario_description="x", t0_cutoff="2024-01-01",
+                prediction={"occurred": True},
+                source_simulation_id=0,
+                source_ensemble_id="ens_source1234",
+            )
+
     def test_missing_scenario_description_rejected(self):
         _make_completed_simulation()
         with pytest.raises(ValueError, match="scenario_description"):
