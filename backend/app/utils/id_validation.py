@@ -60,6 +60,10 @@ def validate_graph_id(graph_id) -> str:
     return _validate(graph_id, "graph_id")
 
 
+def validate_task_id(task_id) -> str:
+    return _validate(task_id, "task_id")
+
+
 def validate_platform_name(platform) -> str:
     if platform not in _ALLOWED_PLATFORMS:
         raise InvalidIdentifierError(
