@@ -17,7 +17,7 @@ import os
 
 import pytest
 
-from app.services.backtest_runner import BacktestRunner
+from app.services.backtest_runner import BacktestCase, BacktestRunner
 from app.services.ensemble_runner import EnsembleRecord, EnsembleMemberRecord, EnsembleRunner
 from app.services.simulation_manager import SimulationManager, SimulationState, SimulationStatus
 from app.services.simulation_runner import RunnerStatus, SimulationRunner, SimulationRunState
@@ -248,6 +248,44 @@ class TestCreateBacktestValidation:
                 source_simulation_id="sim_source12345",
             )
 
+    def test_nan_rank_rejected(self):
+        _make_completed_simulation()
+        with pytest.raises(ValueError, match="rank"):
+            BacktestRunner.create_backtest(
+                scenario_description="x", t0_cutoff="2024-01-01",
+                prediction={"rank": float("nan")},
+                source_simulation_id="sim_source12345",
+            )
+
+    def test_infinite_rank_rejected(self):
+        _make_completed_simulation()
+        with pytest.raises(ValueError, match="rank"):
+            BacktestRunner.create_backtest(
+                scenario_description="x", t0_cutoff="2024-01-01",
+                prediction={"rank": float("inf")},
+                source_simulation_id="sim_source12345",
+            )
+
+    def test_nan_distribution_value_rejected(self):
+        # nan < 0 is False in Python, so a naive non-negativity check alone
+        # would silently accept this.
+        _make_completed_simulation()
+        with pytest.raises(ValueError, match="distribution"):
+            BacktestRunner.create_backtest(
+                scenario_description="x", t0_cutoff="2024-01-01",
+                prediction={"distribution": {"a": float("nan"), "b": 1.0}},
+                source_simulation_id="sim_source12345",
+            )
+
+    def test_infinite_distribution_value_rejected(self):
+        _make_completed_simulation()
+        with pytest.raises(ValueError, match="distribution"):
+            BacktestRunner.create_backtest(
+                scenario_description="x", t0_cutoff="2024-01-01",
+                prediction={"distribution": {"a": float("inf"), "b": 1.0}},
+                source_simulation_id="sim_source12345",
+            )
+
 
 class TestCreateBacktestHappyPath:
     def test_creates_backtest_from_completed_simulation(self):
@@ -257,6 +295,7 @@ class TestCreateBacktestHappyPath:
             t0_cutoff="2024-01-01T00:00:00",
             prediction={"occurred": True, "probability": 0.7, "direction": "up"},
             source_simulation_id="sim_source12345",
+            owner_id="alice",
         )
         assert case.source_simulation_id == "sim_source12345"
         assert case.source_ensemble_id is None
@@ -278,12 +317,31 @@ class TestCreateBacktestHappyPath:
             t0_cutoff="2024-01-01",
             prediction={"distribution": {"a": 0.6, "b": 0.4}},
             source_ensemble_id="ens_source1234",
+            owner_id="bob",
         )
         assert case.source_ensemble_id == "ens_source1234"
         assert case.source_simulation_id is None
         assert case.project_id == "proj_xyz98765"
         assert case.owner_id == "bob"
         assert case.prediction.distribution == {"a": 0.6, "b": 0.4}
+
+    def test_owner_id_is_caller_supplied_not_inherited_from_a_legacy_unowned_source(self):
+        # A source with owner_id=None represents a resource created before
+        # authentication existed; any authenticated user may read it. The
+        # backtest derived from it must NOT also end up owner_id=None
+        # (which would make it a public resource anyone could later submit
+        # a one-shot ground truth against) -- it must be stamped with
+        # whoever actually made this request (the API layer passes this
+        # in from the current authenticated user; the service never
+        # infers it from the source).
+        _make_completed_simulation(owner_id=None, project_id="proj_abc12345")
+        case = BacktestRunner.create_backtest(
+            scenario_description="x", t0_cutoff="2024-01-01",
+            prediction={"occurred": True},
+            source_simulation_id="sim_source12345",
+            owner_id="alice",
+        )
+        assert case.owner_id == "alice"
 
 
 class TestRecordGroundTruth:
@@ -327,6 +385,68 @@ class TestRecordGroundTruth:
         assert reloaded.ground_truth_recorded_at is not None
         assert reloaded.metrics is not None
 
+    def test_concurrent_record_calls_never_both_succeed(self, monkeypatch):
+        # Regression test for the read-check-write race: without the
+        # per-backtest_id lock, two concurrent calls could both read
+        # ground_truth is None before either write landed, and both
+        # "succeed" -- the second one silently clobbering the supposedly
+        # immutable first result. Widen the race window around the write
+        # itself so two real threads reliably interleave there.
+        import threading
+        import time
+        from app.services import backtest_runner as backtest_runner_module
+
+        case = self._create_case({"occurred": True})
+
+        real_write = backtest_runner_module.atomic_write_json
+        entered_write = threading.Event()
+        release_write = threading.Event()
+        first_writer_seen = {"done": False}
+
+        def slow_write(path, data):
+            if not first_writer_seen["done"]:
+                first_writer_seen["done"] = True
+                entered_write.set()
+                release_write.wait(timeout=5)
+            real_write(path, data)
+
+        monkeypatch.setattr(backtest_runner_module, "atomic_write_json", slow_write)
+
+        results = {}
+
+        def submit(occurred, key):
+            try:
+                results[key] = BacktestRunner.record_ground_truth(
+                    case.backtest_id, {"occurred": occurred}
+                )
+            except ValueError as error:
+                results[key] = error
+
+        t1 = threading.Thread(target=submit, args=(True, "first"))
+        t1.start()
+        assert entered_write.wait(timeout=5)  # t1 is now inside the lock, mid-write
+
+        t2 = threading.Thread(target=submit, args=(False, "second"))
+        t2.start()
+        # t2 must block on the lock (held by t1) rather than proceeding to
+        # read ground_truth as None concurrently.
+        time.sleep(0.2)
+        assert t2.is_alive()
+
+        release_write.set()
+        t1.join(timeout=5)
+        t2.join(timeout=5)
+
+        outcomes = list(results.values())
+        successes = [r for r in outcomes if isinstance(r, BacktestCase)]
+        errors = [r for r in outcomes if isinstance(r, ValueError)]
+        assert len(successes) == 1
+        assert len(errors) == 1
+        assert "已经登记过" in str(errors[0])
+
+        reloaded = BacktestRunner.get_backtest(case.backtest_id)
+        assert reloaded.ground_truth.occurred == successes[0].ground_truth.occurred
+
 
 class TestScoringMetrics:
     def _score(self, prediction, ground_truth):
@@ -352,6 +472,15 @@ class TestScoringMetrics:
     def test_brier_score_absent_without_probability(self):
         result = self._score({"occurred": True}, {"occurred": True})
         assert "brier_score" not in result.metrics
+
+    def test_probability_only_prediction_is_scorable_against_occurred(self):
+        # A prediction with ONLY a probability (no point occurred guess) is
+        # a perfectly valid probabilistic forecast -- it must not be
+        # rejected as "unscorable" just because it doesn't also overlap on
+        # the occurred field, and it must still yield a brier_score.
+        result = self._score({"probability": 0.7}, {"occurred": True})
+        assert "event_occurrence_correct" not in result.metrics
+        assert result.metrics["brier_score"] == pytest.approx((0.7 - 1.0) ** 2)
 
     def test_direction_correct_is_case_and_whitespace_insensitive(self):
         result = self._score({"direction": " Up "}, {"direction": "up"})

@@ -169,6 +169,14 @@ class TestGetBacktestRoute:
         response = client.get("/api/backtest/bt_doesnotexist")
         assert response.status_code == 404
 
+    def test_get_with_malformed_id_returns_400_not_500(self, client):
+        # A syntactically-invalid id raises InvalidIdentifierError from
+        # validate_backtest_id; this must reach the app's global 400
+        # handler, not get caught by a broad except-Exception and turned
+        # into a 500 with a leaked traceback.
+        response = client.get("/api/backtest/bad$id")
+        assert response.status_code == 400
+
     def test_get_returns_case(self, client):
         _make_completed_simulation()
         create_response = client.post(

@@ -13,7 +13,13 @@ from . import backtest_bp
 from ..services.backtest_runner import BacktestRunner
 from ..services.simulation_manager import SimulationManager
 from ..services.ensemble_runner import EnsembleRunner
-from ..utils.authorization import authorize, is_owned_by_current_user, ForbiddenError
+from ..utils.authorization import (
+    authorize,
+    current_user_id,
+    is_owned_by_current_user,
+    ForbiddenError,
+)
+from ..utils.id_validation import InvalidIdentifierError
 from ..utils.logger import get_logger
 
 logger = get_logger('mirofish.api.backtest')
@@ -90,6 +96,10 @@ def create_backtest():
             prediction=prediction,
             source_simulation_id=source_simulation_id,
             source_ensemble_id=source_ensemble_id,
+            # 显式传当前已认证用户，而不是让 service 从来源继承 owner_id：
+            # 来源可能是一个认证启用前创建的"无主"历史资源，但由它派生出
+            # 的这个 backtest 必须归属于真正发起这次登记的人。
+            owner_id=current_user_id(),
         )
 
         return jsonify({
@@ -104,6 +114,11 @@ def create_backtest():
         }), 400
 
     except ForbiddenError:
+        raise
+
+    except InvalidIdentifierError:
+        # 交给全局 InvalidIdentifierError 处理器返回 400，而不是被下面的
+        # 通用 Exception 分支吞成一个带 traceback 的 500。
         raise
 
     except Exception as e:
@@ -166,6 +181,9 @@ def record_ground_truth(backtest_id: str):
     except ForbiddenError:
         raise
 
+    except InvalidIdentifierError:
+        raise
+
     except Exception as e:
         logger.error(f"登记回测真实结果失败: {str(e)}")
         return jsonify({
@@ -190,6 +208,8 @@ def get_backtest(backtest_id: str):
             "data": case.to_dict(),
         })
     except ForbiddenError:
+        raise
+    except InvalidIdentifierError:
         raise
     except Exception as e:
         logger.error(f"获取回测失败: {str(e)}")

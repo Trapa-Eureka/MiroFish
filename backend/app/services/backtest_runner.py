@@ -54,6 +54,7 @@ import json
 import math
 import os
 import statistics
+import threading
 import uuid
 from dataclasses import asdict, dataclass, field
 from datetime import datetime
@@ -238,6 +239,20 @@ class BacktestRunner:
         '../../uploads/backtests'
     )
 
+    # 与 EnsembleRunner._ensemble_lock/SimulationRunner._finalization_lock
+    # 同样的模式：每个 backtest_id 一把锁，序列化 record_ground_truth 的
+    # "读取 ground_truth 是否已存在 -> 打分 -> 落盘"整个序列。没有这把锁，
+    # 两个并发的 record_ground_truth 调用可能都在对方写入完成之前读到
+    # ground_truth is None，双双通过"是否已登记过"的检查，其中一次的结果
+    # 会静默覆盖另一次——而这个字段本来被设计成一次性、不可变的证据。
+    _backtest_locks: Dict[str, threading.Lock] = {}
+    _backtest_locks_guard = threading.Lock()
+
+    @classmethod
+    def _backtest_lock(cls, backtest_id: str) -> threading.Lock:
+        with cls._backtest_locks_guard:
+            return cls._backtest_locks.setdefault(backtest_id, threading.Lock())
+
     @classmethod
     def _get_backtest_dir(cls, backtest_id: str) -> str:
         validate_backtest_id(backtest_id)
@@ -288,6 +303,7 @@ class BacktestRunner:
         prediction: Dict[str, Any],
         source_simulation_id: Optional[str] = None,
         source_ensemble_id: Optional[str] = None,
+        owner_id: Optional[str] = None,
     ) -> BacktestCase:
         """
         登记一次回测场景：绑定一个已成功完成的来源（单次模拟或集成）与一份
@@ -302,6 +318,14 @@ class BacktestRunner:
             source_simulation_id: 提供预测依据的单次模拟 ID（与
                 source_ensemble_id 二者恰好提供一个）。
             source_ensemble_id: 提供预测依据的集成 ID。
+            owner_id: 这个新建 backtest 的所有者——调用方（API 层）传入当前
+                已认证用户的 id，而不是从来源模拟/集成的 owner_id 继承。
+                这两者不一定相同：如果来源是一个在启用认证之前创建的"无主"
+                历史资源（owner_id=None），任何已认证用户都可以读它，但由
+                它派生出的这个 backtest 必须归属于真正发起这次登记的人——
+                否则它会继承来源的"无主"状态，变成任何认证用户都能读取、
+                甚至提交一次性真实结果的公共资源。project_id 不受此影响，
+                仍然从来源继承，因为它只是描述性的归类信息，不是访问控制。
         """
         if bool(source_simulation_id) == bool(source_ensemble_id):
             raise ValueError(
@@ -325,7 +349,6 @@ class BacktestRunner:
                     f"来源模拟尚未成功完成，无法作为回测预测依据: {source_simulation_id}"
                 )
             project_id = state.project_id
-            owner_id = state.owner_id
         else:
             record = EnsembleRunner.get_ensemble_record(source_ensemble_id)
             if record is None:
@@ -336,7 +359,6 @@ class BacktestRunner:
                     f"来源集成尚未成功完成，无法作为回测预测依据: {source_ensemble_id}"
                 )
             project_id = record.project_id
-            owner_id = record.owner_id
 
         backtest_id = f"bt_{uuid.uuid4().hex[:12]}"
         case = BacktestCase(
@@ -367,22 +389,28 @@ class BacktestRunner:
         一旦登记过一次，这个 case 就被视为已打分、不可变——重复调用会被
         拒绝，而不是覆盖之前的真实结果（防止"看到分数不满意就悄悄改真实
         结果重新打分"）。
+
+        "读取是否已登记 -> 打分 -> 落盘"整个序列持有同一个 backtest_id 的
+        锁：否则两个并发请求都可能在对方写入完成之前读到 ground_truth
+        is None，双双通过"是否已登记过"的检查，其中一次会静默覆盖另一次
+        本该不可变的结果。
         """
-        case = cls.get_backtest(backtest_id)
-        if case is None:
-            raise ValueError(f"回测不存在: {backtest_id}")
-        if case.ground_truth is not None:
-            raise ValueError(f"该回测已经登记过真实结果，不能重复登记: {backtest_id}")
+        with cls._backtest_lock(backtest_id):
+            case = cls.get_backtest(backtest_id)
+            if case is None:
+                raise ValueError(f"回测不存在: {backtest_id}")
+            if case.ground_truth is not None:
+                raise ValueError(f"该回测已经登记过真实结果，不能重复登记: {backtest_id}")
 
-        parsed_ground_truth = cls._parse_ground_truth(ground_truth)
-        cls._ensure_scorable(case.prediction, parsed_ground_truth)
+            parsed_ground_truth = cls._parse_ground_truth(ground_truth)
+            cls._ensure_scorable(case.prediction, parsed_ground_truth)
 
-        case.ground_truth = parsed_ground_truth
-        case.ground_truth_recorded_at = datetime.now().isoformat()
-        case.metrics = cls._score_case(case.prediction, parsed_ground_truth)
+            case.ground_truth = parsed_ground_truth
+            case.ground_truth_recorded_at = datetime.now().isoformat()
+            case.metrics = cls._score_case(case.prediction, parsed_ground_truth)
 
-        atomic_write_json(cls._backtest_path(backtest_id), case.to_dict())
-        return case
+            atomic_write_json(cls._backtest_path(backtest_id), case.to_dict())
+            return case
 
     @staticmethod
     def _ensure_scorable(prediction: Prediction, ground_truth: GroundTruth) -> None:
@@ -395,7 +423,20 @@ class BacktestRunner:
             prediction.distribution is not None and ground_truth.distribution is not None
         )
         has_rank_overlap = prediction.rank is not None and ground_truth.rank is not None
-        if not (has_scalar_overlap or has_distribution_overlap or has_rank_overlap):
+        # probability 本身不在 _COMPARABLE_SCALAR_FIELDS 里（它不是一个跟
+        # ground_truth 同名字段做相等比较的量），但 probability + 真实的
+        # occurred 恰好就是 Brier score 需要的那对数据——一份只提交了
+        # probability、没有提交 occurred 的合法概率预测，不能因为它没有
+        # 命中 _COMPARABLE_SCALAR_FIELDS 就被判定为"不可打分"。
+        has_probability_overlap = (
+            prediction.probability is not None and ground_truth.occurred is not None
+        )
+        if not (
+            has_scalar_overlap
+            or has_distribution_overlap
+            or has_rank_overlap
+            or has_probability_overlap
+        ):
             raise ValueError(
                 "ground_truth 与该回测登记的 prediction 没有任何可比较的共同字段"
             )
@@ -408,9 +449,14 @@ class BacktestRunner:
             metrics["event_occurrence_correct"] = (
                 prediction.occurred == ground_truth.occurred
             )
-            if prediction.probability is not None:
-                actual = 1.0 if ground_truth.occurred else 0.0
-                metrics["brier_score"] = (prediction.probability - actual) ** 2
+
+        # Brier score 只需要 probability + 真实的 occurred，独立于
+        # prediction 是否也提交了确定性的 occurred 字段——一份"我认为有
+        # 70% 概率会发生"的预测，即使没有额外给出一个二元判断，也应该能
+        # 被打分。
+        if prediction.probability is not None and ground_truth.occurred is not None:
+            actual = 1.0 if ground_truth.occurred else 0.0
+            metrics["brier_score"] = (prediction.probability - actual) ** 2
 
         if prediction.direction is not None and ground_truth.direction is not None:
             metrics["direction_correct"] = (
@@ -438,14 +484,16 @@ class BacktestRunner:
         if prediction.probability is not None:
             if not isinstance(prediction.probability, (int, float)) or isinstance(
                 prediction.probability, bool
-            ):
+            ) or not math.isfinite(prediction.probability):
                 raise ValueError("prediction.probability 必须是数字")
             if not (0.0 <= prediction.probability <= 1.0):
                 raise ValueError("prediction.probability 必须在 0 到 1 之间")
         if prediction.rank is not None and (
-            not isinstance(prediction.rank, (int, float)) or isinstance(prediction.rank, bool)
+            not isinstance(prediction.rank, (int, float))
+            or isinstance(prediction.rank, bool)
+            or not math.isfinite(prediction.rank)
         ):
-            raise ValueError("prediction.rank 必须是数字")
+            raise ValueError("prediction.rank 必须是有限数字")
         if prediction.distribution is not None:
             cls._validate_distribution(prediction.distribution)
         if not cls._has_any_field(prediction):
@@ -461,9 +509,11 @@ class BacktestRunner:
             ground_truth.occurred, ground_truth.direction, ground_truth.sentiment
         )
         if ground_truth.rank is not None and (
-            not isinstance(ground_truth.rank, (int, float)) or isinstance(ground_truth.rank, bool)
+            not isinstance(ground_truth.rank, (int, float))
+            or isinstance(ground_truth.rank, bool)
+            or not math.isfinite(ground_truth.rank)
         ):
-            raise ValueError("ground_truth.rank 必须是数字")
+            raise ValueError("ground_truth.rank 必须是有限数字")
         if ground_truth.distribution is not None:
             cls._validate_distribution(ground_truth.distribution)
         if not cls._has_any_field(ground_truth):
@@ -486,8 +536,13 @@ class BacktestRunner:
         for label, value in distribution.items():
             if not isinstance(label, str):
                 raise ValueError("distribution 的键必须是字符串")
-            if not isinstance(value, (int, float)) or isinstance(value, bool) or value < 0:
-                raise ValueError("distribution 的值必须是非负数字")
+            if (
+                not isinstance(value, (int, float))
+                or isinstance(value, bool)
+                or not math.isfinite(value)
+                or value < 0
+            ):
+                raise ValueError("distribution 的值必须是非负的有限数字")
         if sum(distribution.values()) <= 0:
             raise ValueError("distribution 的值之和必须大于 0")
 
