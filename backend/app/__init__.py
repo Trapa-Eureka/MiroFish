@@ -16,6 +16,7 @@ from .config import Config
 from .utils.logger import setup_logger, get_logger
 from .utils.id_validation import InvalidIdentifierError, PathContainmentError
 from .utils.auth import authenticate_request, AuthenticationError
+from .utils.authorization import ForbiddenError
 
 # /health 不需要认证；其余路径均为 /api/* 蓝图路由
 AUTH_EXEMPT_PATHS = {'/health'}
@@ -107,6 +108,14 @@ def create_app(config_class=Config):
     def handle_path_containment(error):
         get_logger('mirofish.request').error(f"检测到路径越界尝试: {error}")
         return jsonify({"error": "invalid_path", "message": "Invalid resource path"}), 400
+
+    # 统一处理资源所有权授权失败，返回 403
+    @app.errorhandler(ForbiddenError)
+    def handle_forbidden(error):
+        get_logger('mirofish.request').warning(
+            f"拒绝越权访问: {request.method} {request.path} user={getattr(g, 'current_user_id', None)}"
+        )
+        return jsonify({"error": "forbidden", "message": str(error)}), 403
     
     if should_log_startup:
         logger.info("MiroFish Backend 启动完成")
