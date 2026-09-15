@@ -454,14 +454,70 @@ class TestCreateBacktestHappyPath:
         reloaded = BacktestRunner.get_backtest(case.backtest_id)
         assert reloaded.source_run_snapshot_at == "2024-06-01T12:00:00"
 
-    def test_source_run_snapshot_pins_ensemble_created_at(self):
-        record = _make_completed_ensemble()
+    def test_source_run_snapshot_fingerprints_every_completed_member(self):
+        # EnsembleRecord.created_at alone can't detect a member being
+        # restarted in place after the fact (each member is an ordinary,
+        # restartable SimulationRunner simulation from SimulationRunner's
+        # point of view) -- the snapshot must be built from each member's
+        # own started_at instead.
+        _make_completed_ensemble(member_count=2)
+        for i, started_at in enumerate(["2024-01-01T00:00:00", "2024-01-02T00:00:00"]):
+            member_id = f"ens_source1234_m{i}"
+            member_state = SimulationRunner.get_run_state(member_id)
+            member_state.started_at = started_at
+            SimulationRunner._save_run_state(member_state)
+
         case = BacktestRunner.create_backtest(
             scenario_description="x", t0_cutoff="2024-01-01",
             prediction={"occurred": True},
             source_ensemble_id="ens_source1234",
         )
-        assert case.source_run_snapshot_at == record.created_at
+        assert case.source_run_snapshot_at == (
+            "ens_source1234_m0:2024-01-01T00:00:00|"
+            "ens_source1234_m1:2024-01-02T00:00:00"
+        )
+
+        # If a member is later restarted (started_at changes), the pinned
+        # snapshot on the already-created backtest stays frozen, and a
+        # freshly recomputed fingerprint for the current state would no
+        # longer match it -- that mismatch is the detectable signal.
+        member_0 = SimulationRunner.get_run_state("ens_source1234_m0")
+        member_0.started_at = "2024-06-01T00:00:00"
+        SimulationRunner._save_run_state(member_0)
+        reloaded = BacktestRunner.get_backtest(case.backtest_id)
+        assert reloaded.source_run_snapshot_at != (
+            "ens_source1234_m0:2024-06-01T00:00:00|"
+            "ens_source1234_m1:2024-01-02T00:00:00"
+        )
+        assert reloaded.source_run_snapshot_at == case.source_run_snapshot_at
+
+    def test_source_run_snapshot_uses_force_reload_not_stale_cache(self):
+        # Regression test: get_run_state's in-process cache must be
+        # bypassed for this permanent, evidence-locking decision -- a
+        # cached COMPLETED status must not let create_backtest snapshot a
+        # source that has actually since moved on to a new run.
+        _make_completed_simulation()
+        # Prime the process-local cache with a stale COMPLETED entry, then
+        # overwrite the on-disk state to RUNNING without going through
+        # _save_run_state's normal cache-updating path (simulating another
+        # worker process writing to the shared uploads directory).
+        SimulationRunner.get_run_state("sim_source12345")  # populates the cache
+        import json as _json
+        state_path = os.path.join(
+            SimulationRunner._get_sim_dir("sim_source12345"), "run_state.json"
+        )
+        with open(state_path, "r", encoding="utf-8") as f:
+            on_disk = _json.load(f)
+        on_disk["runner_status"] = "running"
+        with open(state_path, "w", encoding="utf-8") as f:
+            _json.dump(on_disk, f)
+
+        with pytest.raises(ValueError, match="尚未成功完成"):
+            BacktestRunner.create_backtest(
+                scenario_description="x", t0_cutoff="2024-01-01",
+                prediction={"occurred": True},
+                source_simulation_id="sim_source12345",
+            )
 
 
 class TestRecordGroundTruth:

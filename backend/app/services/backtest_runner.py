@@ -29,15 +29,22 @@ MiroFish 在这里的角色定位——记账与打分基础设施，不是自�
 
    还有一个相关但更技术性的问题：source_simulation_id 是可以被原地
    重跑复用的（/api/simulation/start 允许对同一个 simulation_id 重新
-   跑一遍，run_state 会被替换）。如果一个 backtest 创建之后，它引用的
-   来源模拟后来被重跑了，这份被锁定的 prediction 名义上还挂在同一个
-   simulation_id 下，但实际支撑它的那次运行已经不是原来那次了——审计
-   链断了。本模块不会、也做不到冻结一份完整的输入快照（那需要连
-   人设/配置/动作日志一起拷贝，超出这个模块的范围），只在创建时记录
-   了来源那次运行的一个可验证时间戳（source_run_snapshot_at：单次模拟
-   用 run_state.started_at，集成用 created_at，因为集成永远不会被原地
-   重跑，每次都是全新的 ensemble_id），供日后人工核对"这个来源是不是
-   还是当初那一次"。
+   跑一遍，run_state 会被替换）；集成本身的 ensemble_id 虽然不会被
+   重跑，但它的每一个成员在 SimulationRunner 眼里就是一次普普通通、
+   同样可以被原地重启的模拟，ensemble_id/created_at 本身侦测不到某个
+   成员被重跑过。如果一个 backtest 创建之后，它引用的来源（或某个
+   集成成员）后来被重跑了，这份被锁定的 prediction 名义上还挂在同一个
+   id 下，但实际支撑它的那次运行已经不是原来那次了——审计链断了。
+   本模块不会、也做不到冻结一份完整的输入快照（那需要连人设/配置/
+   动作日志一起拷贝，超出这个模块的范围），只在创建时记录一个可验证
+   的快照（source_run_snapshot_at）：单次模拟是那次运行的
+   run_state.started_at；集成是把每个已成功完成的成员各自的
+   started_at 拼成的一份复合指纹——只要任何一个成员后来被重启过，它的
+   started_at 就会变，指纹也就对不上了。这两种情况都特意绕开了
+   SimulationRunner.get_run_state 的进程内缓存（force_reload=True，
+   见下面第6条），否则这份"快照"本身就可能基于一份过期的缓存数据。
+   日后可以拿这个字段跟来源当前的实际状态重新核对，一旦对不上就说明
+   "这个来源已经不是当初那一次了"，需要人工核实。
 
 3. 来源必须是一次已经跑到终态并且成功完成的单次模拟（SimulationRunner，
    platform 不限）或一次集成（EnsembleRunner，见 TASK 8），预测的
@@ -59,7 +66,17 @@ MiroFish 在这里的角色定位——记账与打分基础设施，不是自�
    backtest case 在 uploads/backtests/<backtest_id>/backtest.json 下保存
    一份记录。record_ground_truth 之后这份记录被视为不可再变——重新提交
    真实结果会被拒绝，而不是静默覆盖（防止"看到打分不满意就悄悄改真实
-   结果重新打分"）。
+   结果重新打分"）。这份不可变性通过一个独占创建的声明文件
+   （O_CREAT|O_EXCL）实现，而不是进程内的 threading.Lock——后者在多
+   worker/多容器共享同一个 uploads 目录的部署下毫无用处（见
+   record_ground_truth 自己的 docstring）。
+
+6. create_backtest 判断来源"是否已成功完成"、以及为来源生成
+   source_run_snapshot_at 快照时，都会对 SimulationRunner.get_run_state
+   传 force_reload=True，跳过它默认优先使用的进程内缓存。原因见第2条：
+   这两个决定一旦做出就不可撤销（写进一份被当作证据锁定的记录），不能
+   信任一份可能已经过期、由本进程碰巧缓存下来的状态——多 worker 部署下，
+   另一个进程完全可能已经把这个来源重新启动过。
 """
 
 import json
@@ -383,7 +400,11 @@ class BacktestRunner:
             state = manager.get_simulation(source_simulation_id)
             if state is None:
                 raise ValueError(f"来源模拟不存在: {source_simulation_id}")
-            run_state = SimulationRunner.get_run_state(source_simulation_id)
+            # force_reload=True：这是一次要把结果永久锁定成回测证据的
+            # 资格判断，不能信任本进程可能过期的内存缓存——在多 worker
+            # 部署下，另一个进程完全可能已经把这个 simulation_id 重新
+            # 启动了，磁盘上早已不是 COMPLETED。
+            run_state = SimulationRunner.get_run_state(source_simulation_id, force_reload=True)
             if run_state is None or run_state.runner_status != RunnerStatus.COMPLETED:
                 raise ValueError(
                     f"来源模拟尚未成功完成，无法作为回测预测依据: {source_simulation_id}"
@@ -403,7 +424,25 @@ class BacktestRunner:
                     f"来源集成尚未成功完成，无法作为回测预测依据: {source_ensemble_id}"
                 )
             project_id = record.project_id
-            source_run_snapshot_at = record.created_at
+            # EnsembleRecord.created_at 本身不足以证明"这份聚合背后的每个
+            # 成员运行都还是当初那一次"——集成的每个成员本质上就是一次
+            # 普通的、可以被 /api/simulation/start 原地重启的模拟，
+            # ensemble_id/created_at 完全侦测不到某个成员被重跑过。这里
+            # 改成对每个已成功完成的成员现场（同样绕开缓存）取一次
+            # started_at，拼成一个复合指纹——只要任何一个成员后来被重启
+            # 过，它的 started_at 就会变，指纹也就对不上了。
+            member_snapshots = []
+            for member in record.members:
+                if member.start_error is not None:
+                    continue
+                member_run_state = SimulationRunner.get_run_state(
+                    member.simulation_id, force_reload=True
+                )
+                if member_run_state is not None:
+                    member_snapshots.append(
+                        f"{member.simulation_id}:{member_run_state.started_at}"
+                    )
+            source_run_snapshot_at = "|".join(sorted(member_snapshots))
 
         backtest_id = f"bt_{uuid.uuid4().hex[:12]}"
         case = BacktestCase(

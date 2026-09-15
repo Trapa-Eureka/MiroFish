@@ -349,11 +349,26 @@ class SimulationRunner:
             )
     
     @classmethod
-    def get_run_state(cls, simulation_id: str) -> Optional[SimulationRunState]:
-        """获取运行状态"""
-        if simulation_id in cls._run_states:
+    def get_run_state(cls, simulation_id: str, force_reload: bool = False) -> Optional[SimulationRunState]:
+        """
+        获取运行状态。
+
+        默认优先返回本进程内存中缓存的状态——这对绝大多数调用方（状态
+        轮询、监控线程等）都是合适的：缓存只会在本进程自己启动/监控过
+        这个模拟时才存在，本来就该由这个进程的视角为准，且轮询天然会
+        很快看到下一次更新。
+
+        但对于那些要把"当前状态"当场用来做一次不可撤销决定的调用方
+        （例如把某次已完成的模拟结果锁定成回测证据），本进程缓存里的
+        "COMPLETED" 可能只是历史快照——同一个 simulation_id 完全可以在
+        另一个 worker 进程里被重新启动过，磁盘上的 run_state.json 早已
+        变成 STARTING/RUNNING，本进程的缓存却还没有任何理由去刷新。
+        force_reload=True 会跳过缓存、强制从磁盘重新读取（读到的新值
+        仍然会顺带刷新缓存，不会让缓存和磁盘更久地不一致）。
+        """
+        if not force_reload and simulation_id in cls._run_states:
             return cls._run_states[simulation_id]
-        
+
         # 尝试从文件加载
         state = cls._load_run_state(simulation_id)
         if state:
