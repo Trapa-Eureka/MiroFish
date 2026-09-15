@@ -81,7 +81,10 @@ class SimulationState:
     
     # 错误信息
     error: Optional[str] = None
-    
+
+    # 所有权：创建该模拟时所属项目的 owner_id（认证未启用时为 None）
+    owner_id: Optional[str] = None
+
     def to_dict(self) -> Dict[str, Any]:
         """完整状态字典（内部使用）"""
         return {
@@ -103,6 +106,7 @@ class SimulationState:
             "created_at": self.created_at,
             "updated_at": self.updated_at,
             "error": self.error,
+            "owner_id": self.owner_id,
         }
     
     def get_default_platform(self) -> str:
@@ -206,6 +210,7 @@ class SimulationManager:
             created_at=data.get("created_at", datetime.now().isoformat()),
             updated_at=data.get("updated_at", datetime.now().isoformat()),
             error=data.get("error"),
+            owner_id=data.get("owner_id"),
         )
         
         self._simulations[simulation_id] = state
@@ -217,22 +222,24 @@ class SimulationManager:
         graph_id: str,
         enable_twitter: bool = True,
         enable_reddit: bool = True,
+        owner_id: Optional[str] = None,
     ) -> SimulationState:
         """
         创建新的模拟
-        
+
         Args:
             project_id: 项目ID
             graph_id: Zep图谱ID
             enable_twitter: 是否启用Twitter模拟
             enable_reddit: 是否启用Reddit模拟
-            
+            owner_id: 所属项目的 owner_id（认证未启用时为 None）
+
         Returns:
             SimulationState
         """
         import uuid
         simulation_id = f"sim_{uuid.uuid4().hex[:12]}"
-        
+
         state = SimulationState(
             simulation_id=simulation_id,
             project_id=project_id,
@@ -240,6 +247,7 @@ class SimulationManager:
             enable_twitter=enable_twitter,
             enable_reddit=enable_reddit,
             status=SimulationStatus.CREATED,
+            owner_id=owner_id,
         )
         
         self._save_simulation_state(state)
