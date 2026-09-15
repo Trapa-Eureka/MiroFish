@@ -28,6 +28,17 @@ worker 进程能够停止/监控它——这是 SimulationRunner 整体架构自
 读到过期的 run_state"这类场景做额外处理；要修好它需要重新设计
 SimulationRunner 的进程模型（参见路线图中 P2 的 simulation_runner.py
 拆分项），超出了本模块的范围。
+
+第三个已知限制——轮内崩溃可能低报进度：_read_action_log 只在解析到
+round_end 事件时才推进 twitter_current_round / reddit_current_round；
+单条 action 记录只会计入 twitter_actions_count / reddit_actions_count，
+不会单独把某个平台的"当前轮次"往前推。也就是说，如果进程恰好在第 N 轮
+执行到一半（已经记录了这一轮的若干 action，但 round_end 还没写入）时
+被杀死，检查点里该平台的轮次会停留在 N-1，即便动作日志已经证明它至少
+进入过第 N 轮。这是 run_state.json 里 current_round 系列字段本身既有
+的计量粒度（这些字段同时被 run-status API 等其他消费者使用，不是本次
+新增的行为），要修需要改变 _read_action_log 更新这些字段的时机，属于
+比检查点功能更大的改动，这里不做处理，只如实记录。
 """
 
 import json

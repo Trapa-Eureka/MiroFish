@@ -1070,7 +1070,14 @@ class SimulationRunner:
                                         state.current_round = round_num
                                     # 总体时间取两个平台的最大值
                                     state.simulated_hours = max(state.twitter_simulated_hours, state.reddit_simulated_hours)
-                                
+
+                                    # 一轮里所有 Agent 都选择 DO_NOTHING 时，本轮不会有任何
+                                    # 动作触发 add_action()，但轮次确实推进了——updated_at
+                                    # 也要在这里更新，否则以它为"最近一次真正进展"依据的
+                                    # 检查点 checkpointed_at 会显得比实际更旧，让一个仍在
+                                    # 正常推进（只是这一轮恰好没人发言）的模拟被误判为卡住。
+                                    state.updated_at = datetime.now().isoformat()
+
                                 continue
                             
                             action = AgentAction(

@@ -776,3 +776,33 @@ class TestStartFailsClosedWhenCheckpointResetFails:
         finally:
             SimulationRunner._run_states.pop(simulation_id, None)
             SimulationRunner._graph_memory_enabled.pop(simulation_id, None)
+
+
+class TestActionlessRoundStillUpdatesProgressTimestamp:
+    """
+    Regression test for Codex's round-10 finding: a round where every agent
+    chose DO_NOTHING produces a round_end event but zero action records, so
+    add_action() (the only other place updated_at was refreshed) never runs.
+    Without also touching updated_at on round_end, a simulation that is
+    genuinely still advancing would look "stalled" by checkpointed_at even
+    though current_round just moved forward.
+    """
+
+    def test_round_end_with_no_actions_still_advances_updated_at(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(SimulationRunner, "_graph_memory_enabled", {})
+
+        state = SimulationRunState(
+            simulation_id="sim_noaction1234",
+            runner_status=RunnerStatus.RUNNING,
+            updated_at="2020-01-01T00:00:00",
+        )
+        log_path = tmp_path / "actions.jsonl"
+        log_path.write_text(
+            json.dumps({"event_type": "round_end", "round": 3, "simulated_hours": 1}) + "\n",
+            encoding="utf-8",
+        )
+
+        SimulationRunner._read_action_log(str(log_path), 0, state, "twitter")
+
+        assert state.twitter_current_round == 3
+        assert state.updated_at != "2020-01-01T00:00:00"
