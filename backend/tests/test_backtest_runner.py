@@ -84,16 +84,24 @@ def _make_completed_ensemble(
     owner_id="user-1",
     project_id="proj_test1234",
     member_count=2,
+    member_statuses=None,
 ):
     """Constructed by hand (bypassing the launch machinery) since these
     tests only need a *completed* ensemble to reference as a backtest
     source, not the launch/aggregation behavior itself (covered in
-    test_ensemble_runner.py)."""
+    test_ensemble_runner.py). member_statuses, if given, is a list of
+    RunnerStatus values (one per member index) overriding the default
+    COMPLETED for that member."""
     members = []
     for index in range(member_count):
         member_id = f"{ensemble_id}_m{index}"
+        status = (
+            member_statuses[index]
+            if member_statuses and index < len(member_statuses)
+            else RunnerStatus.COMPLETED
+        )
         SimulationRunner._save_run_state(
-            SimulationRunState(simulation_id=member_id, runner_status=RunnerStatus.COMPLETED)
+            SimulationRunState(simulation_id=member_id, runner_status=status)
         )
         members.append(EnsembleMemberRecord(simulation_id=member_id, index=index))
 
@@ -518,6 +526,58 @@ class TestCreateBacktestHappyPath:
                 prediction={"occurred": True},
                 source_simulation_id="sim_source12345",
             )
+
+    def test_ensemble_member_restarted_after_stale_summary_is_rejected(self):
+        # Regression test: get_ensemble_summary() checks each member's
+        # status via the default (possibly stale-cached) get_run_state
+        # path, so it can still report "completed" after another worker
+        # restarted one member in place. The force_reload=True re-check on
+        # each member inside create_backtest's own loop must catch this
+        # and reject the whole request -- not silently include the
+        # restarted member's new started_at in the fingerprint while still
+        # creating the backtest.
+        _make_completed_ensemble(member_count=2)
+        # Populate the cache with COMPLETED for both members (mirrors what
+        # get_ensemble_summary's own default-path read would have primed),
+        # then move member 0 to RUNNING only on disk -- simulating another
+        # worker process restarting it without this process's cache ever
+        # being told.
+        SimulationRunner.get_run_state("ens_source1234_m0")
+        SimulationRunner.get_run_state("ens_source1234_m1")
+        state_path = os.path.join(
+            SimulationRunner._get_sim_dir("ens_source1234_m0"), "run_state.json"
+        )
+        with open(state_path, "r", encoding="utf-8") as f:
+            on_disk = json.load(f)
+        on_disk["runner_status"] = "running"
+        with open(state_path, "w", encoding="utf-8") as f:
+            json.dump(on_disk, f)
+
+        with pytest.raises(ValueError, match="尚未成功完成"):
+            BacktestRunner.create_backtest(
+                scenario_description="x", t0_cutoff="2024-01-01",
+                prediction={"occurred": True},
+                source_ensemble_id="ens_source1234",
+            )
+
+    def test_ensemble_with_some_failed_members_still_creatable(self):
+        # A member that genuinely FAILED (not restarted -- just never
+        # succeeded) must not block backtest creation: it was never part
+        # of EnsembleRunner's aggregate/prediction basis in the first
+        # place (see TASK 8's _compute_aggregate), so its status is
+        # irrelevant to this backtest's provenance.
+        _make_completed_ensemble(
+            member_count=2,
+            member_statuses=[RunnerStatus.COMPLETED, RunnerStatus.FAILED],
+        )
+
+        case = BacktestRunner.create_backtest(
+            scenario_description="x", t0_cutoff="2024-01-01",
+            prediction={"occurred": True},
+            source_ensemble_id="ens_source1234",
+        )
+        assert "ens_source1234_m0" in case.source_run_snapshot_at
+        assert "ens_source1234_m1" not in case.source_run_snapshot_at
 
 
 class TestRecordGroundTruth:

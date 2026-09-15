@@ -418,6 +418,11 @@ class BacktestRunner:
             record = EnsembleRunner.get_ensemble_record(source_ensemble_id)
             if record is None:
                 raise ValueError(f"来源集成不存在: {source_ensemble_id}")
+            # 这里只用 get_ensemble_summary()（它对每个成员走的是
+            # get_run_state 的默认缓存路径）做一次廉价的提前退出——如果
+            # 连这个可能过期的视角都认为"没完成"，就没必要再往下做一遍
+            # 更贵的、绕开缓存的复核了。真正决定"能不能被这份回测锁定"的
+            # 是下面对每个成员 force_reload 之后的复核，而不是这次判断。
             summary = EnsembleRunner.get_ensemble_summary(source_ensemble_id)
             if summary["status"] != "completed":
                 raise ValueError(
@@ -428,9 +433,17 @@ class BacktestRunner:
             # 成员运行都还是当初那一次"——集成的每个成员本质上就是一次
             # 普通的、可以被 /api/simulation/start 原地重启的模拟，
             # ensemble_id/created_at 完全侦测不到某个成员被重跑过。这里
-            # 改成对每个已成功完成的成员现场（同样绕开缓存）取一次
-            # started_at，拼成一个复合指纹——只要任何一个成员后来被重启
-            # 过，它的 started_at 就会变，指纹也就对不上了。
+            # 对每个成员用 force_reload=True 重新读一遍真实状态（跳过可能
+            # 过期的进程内缓存——上面 summary 用的缓存路径可能仍然认为某个
+            # 已经被重启、此刻正在 RUNNING 的成员是 COMPLETED），只对确实
+            # 仍处于 COMPLETED 的成员计入这份回测的"已完成成员"集合；任何
+            # 非 start_error 成员如果 force_reload 后不再是 COMPLETED
+            # （无论是仍在跑、还是被重启后又在跑），都不能被当作这份预测
+            # 的可信依据，必须整体拒绝，而不是悄悄把它排除在指纹之外——
+            # 否则集成的聚合结果和这份指纹描述的成员集合就对不上了。
+            # FAILED/STOPPED 的成员则正常跳过：它们本来就不参与
+            # EnsembleRunner 的聚合统计（见 TASK 8 的 _compute_aggregate），
+            # 状态变化与这份预测的可信度无关。
             member_snapshots = []
             for member in record.members:
                 if member.start_error is not None:
@@ -438,10 +451,27 @@ class BacktestRunner:
                 member_run_state = SimulationRunner.get_run_state(
                     member.simulation_id, force_reload=True
                 )
-                if member_run_state is not None:
-                    member_snapshots.append(
-                        f"{member.simulation_id}:{member_run_state.started_at}"
+                if member_run_state is None:
+                    raise ValueError(
+                        f"来源集成尚未成功完成，无法作为回测预测依据: {source_ensemble_id}"
                     )
+                if member_run_state.runner_status in (
+                    RunnerStatus.FAILED, RunnerStatus.STOPPED
+                ):
+                    continue
+                if member_run_state.runner_status != RunnerStatus.COMPLETED:
+                    raise ValueError(
+                        f"来源集成尚未成功完成，无法作为回测预测依据: {source_ensemble_id}"
+                        f"（成员 {member.simulation_id} 当前不处于已完成状态，"
+                        f"可能已被重新启动）"
+                    )
+                member_snapshots.append(
+                    f"{member.simulation_id}:{member_run_state.started_at}"
+                )
+            if not member_snapshots:
+                raise ValueError(
+                    f"来源集成尚未成功完成，无法作为回测预测依据: {source_ensemble_id}"
+                )
             source_run_snapshot_at = "|".join(sorted(member_snapshots))
 
         backtest_id = f"bt_{uuid.uuid4().hex[:12]}"
