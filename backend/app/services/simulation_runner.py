@@ -487,10 +487,16 @@ class SimulationRunner:
         Returns:
             SimulationRunState
         """
+        # 纯输入校验，在认领 simulation_id / 创建任何状态之前完成，这样它
+        # 失败时不需要任何终态清理——不像认领之后才发现的失败路径那样，
+        # 需要显式把 run_state.json 和 checkpoint.json 都落到 FAILED。
+        if enable_graph_memory_update and not graph_id:
+            raise ValueError("启用图谱记忆更新时必须提供 graph_id")
+
         # 加载模拟配置
         sim_dir = cls._get_sim_dir(simulation_id)
         config_path = os.path.join(sim_dir, "simulation_config.json")
-        
+
         if not os.path.exists(config_path):
             raise ValueError(f"模拟配置不存在，请先调用 /prepare 接口")
         
@@ -546,11 +552,8 @@ class SimulationRunner:
             except Exception:
                 logger.exception(f"重置检查点失败: simulation_id={simulation_id}")
         
-        # 如果启用图谱记忆更新，创建更新器
+        # 如果启用图谱记忆更新，创建更新器（graph_id 已在方法开头校验过）
         if enable_graph_memory_update:
-            if not graph_id:
-                raise ValueError("启用图谱记忆更新时必须提供 graph_id")
-            
             try:
                 ZepGraphMemoryManager.create_updater(simulation_id, graph_id)
                 cls._graph_memory_enabled[simulation_id] = True

@@ -464,3 +464,39 @@ class TestStartupFailureBeforeMonitorPersistsCheckpoint:
         finally:
             SimulationRunner._run_states.pop(simulation_id, None)
             SimulationRunner._graph_memory_enabled.pop(simulation_id, None)
+
+    def test_missing_graph_id_fails_before_claiming_run_or_touching_checkpoint(
+        self, tmp_path, monkeypatch
+    ):
+        """
+        Regression test for Codex's round-4 finding: enable_graph_memory_update=True
+        with no graph_id used to raise *after* the checkpoint had already been
+        reset to STARTING, leaving it stuck there forever since this path
+        never reached any FAILED-transition/checkpoint-save code. It must now
+        be validated before the run is claimed at all, so it leaves no trace.
+        """
+        simulation_id = "sim_nographid12"
+        sim_dir = tmp_path / "runs" / simulation_id
+        sim_dir.mkdir(parents=True)
+        (sim_dir / "simulation_config.json").write_text(
+            json.dumps({
+                "time_config": {"total_simulation_hours": 1, "minutes_per_round": 60},
+            }),
+            encoding="utf-8",
+        )
+
+        monkeypatch.setattr(SimulationRunner, "RUN_STATE_DIR", str(tmp_path / "runs"))
+        monkeypatch.setattr(SimulationRunner, "_run_states", {})
+
+        with pytest.raises(ValueError, match="graph_id"):
+            SimulationRunner.start_simulation(
+                simulation_id,
+                platform="parallel",
+                enable_graph_memory_update=True,
+                graph_id=None,
+            )
+
+        # No run_state.json and no checkpoint.json should have been written --
+        # the validation must fail before the run is ever claimed.
+        assert simulation_id not in SimulationRunner._run_states
+        assert load_checkpoint(str(sim_dir)) is None
