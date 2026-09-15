@@ -35,16 +35,29 @@
    （ensemble.json：source_simulation_id、成员列表、启动期失败信息等），
    不需要状态机/CAS——它不是一个会被并发更新的活跃状态，聚合结果永远是
    现算的。
+
+5. 单平台成员的聚合数据来源与 parallel 成员不同：run_parallel_simulation.py
+   会把 OASIS 自带的 SQLite trace 表镜像成 <platform>/actions.jsonl 并
+   同步更新 run_state 的 twitter_actions_count/reddit_actions_count/
+   current_round；但 run_twitter_simulation.py / run_reddit_simulation.py
+   这两个独立单平台脚本只写 trace 表，从不镜像 actions.jsonl，所以对这类
+   成员，run_state 里的这些字段永远是 0（这是这两个脚本本身既有的、比
+   本模块更早存在的限制，不在本次改动范围内修复）。因此单平台成员的
+   动作计数/结果频率改为直接读 trace 表现算，复刻 run_parallel_simulation.py
+   把 trace 记录过滤/映射成有意义动作类型的同一套规则；但 rounds_reached
+   对单平台成员确实拿不到可信数据，这里选择诚实地不把它计入该项统计，
+   而不是编造一个数字。
 """
 
 import json
 import os
 import shutil
+import sqlite3
 import statistics
 import uuid
 from dataclasses import asdict, dataclass, field
 from datetime import datetime
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from ..config import Config
 from ..utils.logger import get_logger
@@ -56,6 +69,29 @@ from .simulation_runner import SimulationRunner, RunnerStatus
 logger = get_logger('mirofish.ensemble')
 
 ENSEMBLE_FILENAME = "ensemble.json"
+
+# 与 scripts/run_parallel_simulation.py 中同名常量保持一致：并行脚本用它们
+# 把 SQLite trace 表的原始记录过滤/映射成 actions.jsonl 里的 action_type。
+# 单平台成员没有 actions.jsonl，这里直接对 trace 表复刻同一套规则，两条
+# 聚合路径的统计口径才不会不一致。若上游修改了那份映射，这里也需要同步。
+_TRACE_FILTERED_ACTIONS = {'refresh', 'sign_up'}
+_TRACE_ACTION_TYPE_MAP = {
+    'create_post': 'CREATE_POST',
+    'like_post': 'LIKE_POST',
+    'dislike_post': 'DISLIKE_POST',
+    'repost': 'REPOST',
+    'quote_post': 'QUOTE_POST',
+    'follow': 'FOLLOW',
+    'mute': 'MUTE',
+    'create_comment': 'CREATE_COMMENT',
+    'like_comment': 'LIKE_COMMENT',
+    'dislike_comment': 'DISLIKE_COMMENT',
+    'search_posts': 'SEARCH_POSTS',
+    'search_user': 'SEARCH_USER',
+    'trend': 'TREND',
+    'do_nothing': 'DO_NOTHING',
+    'interview': 'INTERVIEW',
+}
 
 # 单次集成允许的成员数量上限。每个成员都是一次完整的、由 LLM 驱动的模拟
 # 子进程，成本与运行中的模拟运行时间成正比；这里做一个保守的硬上限，
@@ -96,7 +132,10 @@ class EnsembleMemberRecord:
 
 @dataclass
 class EnsembleRecord:
-    """一次集成的不可变创建记录，创建后只读，聚合状态永远现算。"""
+    """
+    一次集成的创建记录。除 cancelled 外的所有字段在创建后只读，聚合状态
+    永远现算。cancelled 是唯一的例外——见其字段说明。
+    """
     ensemble_id: str
     source_simulation_id: str
     project_id: str
@@ -107,6 +146,14 @@ class EnsembleRecord:
     members: List[EnsembleMemberRecord]
     created_at: str
     owner_id: Optional[str] = None
+    # 唯一允许在创建后被改写的字段：一个单调的、一旦为 True 就不会变回
+    # False 的取消信号。stop_ensemble 在还有成员尚未被 start_ensemble 的
+    # 启动循环处理到时（run_state 还不存在，没法直接停止一个不存在的
+    # 模拟）把它设为 True；启动循环在每次尝试下一个成员之前会重新读盘
+    # 检查这个信号，一旦看到就不再启动剩余成员，把它们标记为"已取消"而
+    # 不是启动后再停止——否则一次“停止集成”请求会因为与仍在进行的启动
+    # 循环存在竞争，而在返回成功之后仍然让部分成员继续跑下去。
+    cancelled: bool = False
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -120,6 +167,7 @@ class EnsembleRecord:
             "members": [m.to_dict() for m in self.members],
             "created_at": self.created_at,
             "owner_id": self.owner_id,
+            "cancelled": self.cancelled,
         }
 
     @classmethod
@@ -135,6 +183,7 @@ class EnsembleRecord:
             members=[EnsembleMemberRecord.from_dict(m) for m in data.get("members", [])],
             created_at=data.get("created_at", datetime.now().isoformat()),
             owner_id=data.get("owner_id"),
+            cancelled=data.get("cancelled", False),
         )
 
 
@@ -296,60 +345,69 @@ class EnsembleRunner:
         for index in range(run_count):
             member_id = f"{ensemble_id}_m{index}"
             start_error: Optional[str] = None
-            try:
-                member_dir = manager._get_simulation_dir(member_id)
-                for filename in files_to_copy:
-                    src_path = os.path.join(source_dir, filename)
-                    if not os.path.exists(src_path):
-                        # enable_reddit/enable_twitter 为 True 但对应文件缺失，
-                        # 说明来源模拟本身处于不一致状态——让这个成员启动
-                        # 失败并记录原因，而不是启动一个缺人设的模拟。
-                        raise FileNotFoundError(f"来源模拟缺少 {filename}")
-                    shutil.copyfile(src_path, os.path.join(member_dir, filename))
 
-                member_state = SimulationState(
-                    simulation_id=member_id,
-                    project_id=source_state.project_id,
-                    graph_id=source_state.graph_id,
-                    enable_twitter=source_state.enable_twitter,
-                    enable_reddit=source_state.enable_reddit,
-                    status=SimulationStatus.READY,
-                    entities_count=source_state.entities_count,
-                    profiles_count=source_state.profiles_count,
-                    entity_types=list(source_state.entity_types),
-                    profiles_generated=True,
-                    config_generated=True,
-                    config_reasoning=source_state.config_reasoning,
-                    owner_id=source_state.owner_id,
-                    # 人设文件是原样拷贝的，不是重新生成的，所以沿用同一个
-                    # random_seed 是诚实的——它就是这份被拷贝的人设实际使用
-                    # 过的种子，而不是一个凭空分配、从未真正生效过的新种子。
-                    random_seed=source_state.random_seed,
-                )
-                manager._save_simulation_state(member_state)
+            # 每次启动下一个成员之前都重新读盘检查取消信号：一次并发的
+            # stop_ensemble 调用可能已经把这个集成标记为已取消（它没法
+            # 直接停止一个还不存在 run_state 的成员，只能设置这个信号，
+            # 依赖这里的检查来阻止它被启动）。
+            current_on_disk = cls.get_ensemble_record(ensemble_id)
+            if current_on_disk is not None and current_on_disk.cancelled:
+                start_error = "集成已被取消，未尝试启动"
+            else:
+                try:
+                    member_dir = manager._get_simulation_dir(member_id)
+                    for filename in files_to_copy:
+                        src_path = os.path.join(source_dir, filename)
+                        if not os.path.exists(src_path):
+                            # enable_reddit/enable_twitter 为 True 但对应文件缺失，
+                            # 说明来源模拟本身处于不一致状态——让这个成员启动
+                            # 失败并记录原因，而不是启动一个缺人设的模拟。
+                            raise FileNotFoundError(f"来源模拟缺少 {filename}")
+                        shutil.copyfile(src_path, os.path.join(member_dir, filename))
 
-                # graph_id=None：集成成员不写入 Zep 图谱记忆——N 个成员并发
-                # 把各自的模拟活动写回同一个图谱会相互践踏且没有明确语义
-                # （"图谱应该记住哪一次运行？"）。这是一个有意识的范围限制，
-                # 而不是遗漏；需要图谱记忆更新的场景应该用单次模拟运行。
-                SimulationRunner.start_simulation(
-                    simulation_id=member_id,
-                    platform=resolved_platform,
-                    max_rounds=max_rounds,
-                    enable_graph_memory_update=False,
-                    graph_id=None,
-                    # 集成成员没有人工操作者去调用 interview/close：不传
-                    # no_wait 的话，子进程会在跑完所有轮次后停留在等待
-                    # 命令的状态，SimulationRunner 永远看不到进程退出，
-                    # 这个成员也就永远不会变成 COMPLETED，集成也就永远
-                    # 凑不齐聚合所需的终态成员。
-                    no_wait=True,
-                )
-            except Exception as error:
-                logger.exception(
-                    f"集成成员启动失败: ensemble_id={ensemble_id}, member_id={member_id}"
-                )
-                start_error = str(error)
+                    member_state = SimulationState(
+                        simulation_id=member_id,
+                        project_id=source_state.project_id,
+                        graph_id=source_state.graph_id,
+                        enable_twitter=source_state.enable_twitter,
+                        enable_reddit=source_state.enable_reddit,
+                        status=SimulationStatus.READY,
+                        entities_count=source_state.entities_count,
+                        profiles_count=source_state.profiles_count,
+                        entity_types=list(source_state.entity_types),
+                        profiles_generated=True,
+                        config_generated=True,
+                        config_reasoning=source_state.config_reasoning,
+                        owner_id=source_state.owner_id,
+                        # 人设文件是原样拷贝的，不是重新生成的，所以沿用同一个
+                        # random_seed 是诚实的——它就是这份被拷贝的人设实际使用
+                        # 过的种子，而不是一个凭空分配、从未真正生效过的新种子。
+                        random_seed=source_state.random_seed,
+                    )
+                    manager._save_simulation_state(member_state)
+
+                    # graph_id=None：集成成员不写入 Zep 图谱记忆——N 个成员并发
+                    # 把各自的模拟活动写回同一个图谱会相互践踏且没有明确语义
+                    # （"图谱应该记住哪一次运行？"）。这是一个有意识的范围限制，
+                    # 而不是遗漏；需要图谱记忆更新的场景应该用单次模拟运行。
+                    SimulationRunner.start_simulation(
+                        simulation_id=member_id,
+                        platform=resolved_platform,
+                        max_rounds=max_rounds,
+                        enable_graph_memory_update=False,
+                        graph_id=None,
+                        # 集成成员没有人工操作者去调用 interview/close：不传
+                        # no_wait 的话，子进程会在跑完所有轮次后停留在等待
+                        # 命令的状态，SimulationRunner 永远看不到进程退出，
+                        # 这个成员也就永远不会变成 COMPLETED，集成也就永远
+                        # 凑不齐聚合所需的终态成员。
+                        no_wait=True,
+                    )
+                except Exception as error:
+                    logger.exception(
+                        f"集成成员启动失败: ensemble_id={ensemble_id}, member_id={member_id}"
+                    )
+                    start_error = str(error)
 
             members.append(EnsembleMemberRecord(
                 simulation_id=member_id,
@@ -357,7 +415,55 @@ class EnsembleRunner:
                 start_error=start_error,
             ))
 
-        record = EnsembleRecord(
+            # 每尝试完一个成员就重新落盘一次快照（已尝试过的成员带着真实
+            # start_error，尚未轮到的成员沿用临时占位记录）。这样即使 worker
+            # 在循环中途整个崩溃，暴露出的"启动结果未知"窗口也只是"崩溃那
+            # 一刻正在处理的那一个成员"，而不是循环结束前才写入的整批成员。
+            # 完全消除这个窗口需要一套心跳/存活检测机制来分辨"还没轮到"和
+            # "启动器已经死了、永远不会轮到"——这类机制目前在
+            # SimulationRunner 自身的单进程架构里也没有（见模块文档第3条
+            # 引用的 TASK 7 结论），本模块选择不新增这套机制，只把已尝试
+            # 部分的可见窗口缩到最小。写入本身是尽力而为的：failure 只记
+            # 日志，不影响已经启动（或已经失败）的成员——它们是真实、可能
+            # 已产生 LLM 调用成本的进程，不应该因为记录簿记失败被回滚。
+            try:
+                # 用刚读到的最新 on-disk 状态（而不是这次调用开头缓存的
+                # current_on_disk）来决定要写回的 cancelled 值：本次迭代
+                # 启动成员的过程中，一次并发的 stop_ensemble 完全可能刚刚
+                # 才把 cancelled 置为 True——如果这里无脑写回 False（新建
+                # EnsembleRecord 默认值），就会把那次取消覆盖掉，下一轮
+                # 迭代的检查也就看不到它了。
+                latest_on_disk = cls.get_ensemble_record(ensemble_id)
+                still_cancelled = bool(latest_on_disk and latest_on_disk.cancelled)
+                atomic_write_json(
+                    cls._ensemble_path(ensemble_id),
+                    EnsembleRecord(
+                        ensemble_id=ensemble_id,
+                        source_simulation_id=source_simulation_id,
+                        project_id=source_state.project_id,
+                        graph_id=source_state.graph_id,
+                        platform=resolved_platform,
+                        max_rounds=max_rounds,
+                        run_count=run_count,
+                        members=members + provisional_members[index + 1:],
+                        created_at=provisional_record.created_at,
+                        owner_id=source_state.owner_id,
+                        cancelled=still_cancelled,
+                    ).to_dict(),
+                )
+            except Exception:
+                logger.exception(
+                    f"写入集成记录快照失败（成员已启动，临时记录仍然可见）: "
+                    f"ensemble_id={ensemble_id}, member_index={index}"
+                )
+
+        if all(m.start_error is not None for m in members):
+            logger.error(
+                f"集成的所有成员均启动失败: ensemble_id={ensemble_id}"
+            )
+
+        final_on_disk = cls.get_ensemble_record(ensemble_id)
+        return EnsembleRecord(
             ensemble_id=ensemble_id,
             source_simulation_id=source_simulation_id,
             project_id=source_state.project_id,
@@ -368,28 +474,8 @@ class EnsembleRunner:
             members=members,
             created_at=provisional_record.created_at,
             owner_id=source_state.owner_id,
+            cancelled=bool(final_on_disk and final_on_disk.cancelled),
         )
-        try:
-            atomic_write_json(cls._ensemble_path(ensemble_id), record.to_dict())
-        except Exception:
-            # 最终这份带有各成员 start_error 详情的记录写入失败了，但成员
-            # 已经在跑（或已经失败）——上面的临时记录已经让这个集成对
-            # /list、summary、/stop 可见，只是 start_error 字段会暂时停留
-            # 在"未知"（run_state 不存在时，summary 会把它当作 starting
-            # 处理）。这里选择不回滚/终止已经启动的成员：它们是真实、可能
-            # 已产生 LLM 调用成本的进程，"记录写入失败"不应该反过来杀掉
-            # 已经在花钱运行的模拟。
-            logger.exception(
-                f"写入集成最终记录失败（成员已启动，临时记录仍然可见）: "
-                f"ensemble_id={ensemble_id}"
-            )
-
-        if all(m.start_error is not None for m in members):
-            logger.error(
-                f"集成的所有成员均启动失败: ensemble_id={ensemble_id}"
-            )
-
-        return record
 
     # ────────────────────────── 停止 ──────────────────────────
 
@@ -399,6 +485,22 @@ class EnsembleRunner:
         record = cls.get_ensemble_record(ensemble_id)
         if record is None:
             raise ValueError(f"集成不存在: {ensemble_id}")
+
+        # 先把取消信号落盘，再去停止已经存在 run_state 的成员：即使
+        # start_ensemble 的启动循环此刻正卡在还没轮到的成员上，它在处理
+        # 下一个成员之前都会重新读到这个信号并停止继续启动（见
+        # start_ensemble 内的检查）。顺序很重要——先设信号，避免出现
+        # "信号还没落盘，启动循环又启动了一个新成员，而这次 stop 调用
+        # 已经把已存在的成员都停完并返回成功" 的竞争窗口。
+        if not record.cancelled:
+            try:
+                record.cancelled = True
+                atomic_write_json(cls._ensemble_path(ensemble_id), record.to_dict())
+            except Exception:
+                logger.exception(
+                    f"写入集成取消信号失败（仍会继续尝试停止已存在的成员）: "
+                    f"ensemble_id={ensemble_id}"
+                )
 
         results: Dict[str, Any] = {}
         for member in record.members:
@@ -540,17 +642,33 @@ class EnsembleRunner:
             run_state = SimulationRunner.get_run_state(member_id)
             if run_state is None:
                 continue
-            numeric_samples["total_actions_count"].append(
-                run_state.twitter_actions_count + run_state.reddit_actions_count
-            )
-            numeric_samples["twitter_actions_count"].append(run_state.twitter_actions_count)
-            numeric_samples["reddit_actions_count"].append(run_state.reddit_actions_count)
-            numeric_samples["rounds_reached"].append(run_state.current_round)
-
             member_dir = manager._get_simulation_dir(member_id)
-            action_types_seen_this_run = cls._tally_action_types(
-                member_dir, action_type_total_counts
-            )
+
+            if record.platform == "parallel":
+                # 并行脚本会把 trace 表镜像成 actions.jsonl 并同步更新
+                # run_state 的动作计数/current_round，两者都是可信的。
+                twitter_count = run_state.twitter_actions_count
+                reddit_count = run_state.reddit_actions_count
+                numeric_samples["rounds_reached"].append(run_state.current_round)
+                action_types_seen_this_run = cls._tally_action_types(
+                    member_dir, action_type_total_counts
+                )
+            else:
+                # 单平台独立脚本从不镜像 actions.jsonl，run_state 里的这些
+                # 字段恒为 0（见模块文档第5条）；直接读 trace 表现算。
+                # rounds_reached 对这类成员拿不到可信数据，诚实地不计入。
+                platform_count, action_types_seen_this_run = (
+                    cls._tally_action_types_from_trace_db(
+                        member_dir, record.platform, action_type_total_counts
+                    )
+                )
+                twitter_count = platform_count if record.platform == "twitter" else 0
+                reddit_count = platform_count if record.platform == "reddit" else 0
+
+            numeric_samples["total_actions_count"].append(twitter_count + reddit_count)
+            numeric_samples["twitter_actions_count"].append(twitter_count)
+            numeric_samples["reddit_actions_count"].append(reddit_count)
+
             for action_type in action_types_seen_this_run:
                 action_type_run_occurrences[action_type] = (
                     action_type_run_occurrences.get(action_type, 0) + 1
@@ -614,6 +732,48 @@ class EnsembleRunner:
             except Exception:
                 logger.exception(f"读取动作日志失败（聚合统计）: {log_path}")
         return seen_this_run
+
+    @staticmethod
+    def _tally_action_types_from_trace_db(
+        member_dir: str, platform: str, running_totals: Dict[str, int]
+    ) -> Tuple[int, set]:
+        """
+        单平台成员（platform=twitter/reddit）专用统计路径。
+
+        run_twitter_simulation.py / run_reddit_simulation.py 只把动作写进
+        OASIS 自带的 SQLite trace 表（<platform>_simulation.db），不会像
+        run_parallel_simulation.py 那样额外镜像出一份 actions.jsonl，所以
+        _tally_action_types 对这类成员目录什么都找不到。这里直接读 trace
+        表，套用与并行脚本完全一致的过滤（跳过 refresh/sign_up）与动作
+        类型映射规则（_TRACE_FILTERED_ACTIONS/_TRACE_ACTION_TYPE_MAP），
+        保证两条聚合路径的统计口径一致。
+
+        Returns:
+            (该成员过滤后的动作总数, 这次运行里"至少出现过一次"的
+             action_type 集合)
+        """
+        seen_this_run = set()
+        total_count = 0
+        db_path = os.path.join(member_dir, f"{platform}_simulation.db")
+        if not os.path.exists(db_path):
+            return total_count, seen_this_run
+        try:
+            conn = sqlite3.connect(db_path)
+            try:
+                cursor = conn.cursor()
+                cursor.execute("SELECT action FROM trace")
+                for (action,) in cursor.fetchall():
+                    if not action or action in _TRACE_FILTERED_ACTIONS:
+                        continue
+                    action_type = _TRACE_ACTION_TYPE_MAP.get(action, action.upper())
+                    running_totals[action_type] = running_totals.get(action_type, 0) + 1
+                    seen_this_run.add(action_type)
+                    total_count += 1
+            finally:
+                conn.close()
+        except Exception:
+            logger.exception(f"读取动作数据库失败（聚合统计）: {db_path}")
+        return total_count, seen_this_run
 
     @staticmethod
     def _summarize_numeric(values: List[float]) -> Dict[str, Any]:

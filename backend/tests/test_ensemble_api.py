@@ -139,6 +139,24 @@ class TestStartEnsembleRoute:
         )
         assert response.status_code == 400
 
+    def test_start_with_malformed_json_body_returns_400_not_500(self, client):
+        # request.get_json() (without silent=True) raises a werkzeug
+        # BadRequest/UnsupportedMediaType for a missing/invalid JSON body,
+        # which the route's broad except-Exception used to convert into a
+        # 500 with a leaked traceback instead of a clean 4xx.
+        response = client.post(
+            "/api/ensemble/start",
+            data="{not valid json",
+            content_type="application/json",
+        )
+        assert response.status_code == 400
+        assert response.json["success"] is False
+
+    def test_start_with_no_content_type_returns_400_not_500(self, client):
+        response = client.post("/api/ensemble/start")
+        assert response.status_code == 400
+        assert response.json["success"] is False
+
     def test_start_happy_path_returns_members(self, client):
         _make_source_simulation()
         response = client.post(
@@ -197,6 +215,15 @@ class TestStopEnsembleRoute:
     def test_stop_requires_ensemble_id(self, client):
         response = client.post("/api/ensemble/stop", json={})
         assert response.status_code == 400
+
+    def test_stop_with_malformed_json_body_returns_400_not_500(self, client):
+        response = client.post(
+            "/api/ensemble/stop",
+            data="{not valid json",
+            content_type="application/json",
+        )
+        assert response.status_code == 400
+        assert response.json["success"] is False
 
     def test_stop_404_when_missing(self, client):
         response = client.post("/api/ensemble/stop", json={"ensemble_id": "ens_doesnotexist"})

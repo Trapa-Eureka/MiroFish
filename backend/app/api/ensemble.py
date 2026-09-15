@@ -60,7 +60,7 @@ def start_ensemble():
     同一个 Zep 图谱没有明确语义，需要图谱记忆更新的场景请用单次模拟运行。
     """
     try:
-        data = request.get_json() or {}
+        data = request.get_json(silent=True) or {}
 
         source_simulation_id = data.get('source_simulation_id')
         if not source_simulation_id:
@@ -189,7 +189,7 @@ def list_ensembles():
 def stop_ensemble():
     """停止集成中所有仍处于非终态的成员（尽力而为，逐成员报告结果）。"""
     try:
-        data = request.get_json() or {}
+        data = request.get_json(silent=True) or {}
         ensemble_id = data.get('ensemble_id')
         if not ensemble_id:
             return jsonify({

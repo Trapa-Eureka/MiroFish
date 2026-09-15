@@ -14,6 +14,7 @@
 
 import json
 import os
+import sqlite3
 
 import pytest
 
@@ -431,8 +432,16 @@ class TestEnsembleSummaryAggregation:
         assert summary["aggregate"] is None
 
     def test_aggregate_computed_once_all_members_terminal(self):
-        _make_source_simulation()
-        record = EnsembleRunner.start_ensemble("sim_source12345", run_count=3)
+        # platform="parallel" specifically: it's the only mode whose run
+        # script mirrors the SQLite trace table into actions.jsonl and keeps
+        # run_state's action counters/current_round in sync, which is what
+        # this test's fixtures (_complete_member, _write_action_log) drive.
+        # Single-platform (twitter/reddit) aggregation is covered separately
+        # in TestSinglePlatformAggregationReadsTraceDb below.
+        _make_source_simulation(enable_reddit=True, enable_twitter=True)
+        record = EnsembleRunner.start_ensemble(
+            "sim_source12345", run_count=3, platform="parallel"
+        )
         member_ids = [m.simulation_id for m in record.members]
 
         _complete_member(member_ids[0], reddit_actions=10, rounds_reached=4)
@@ -473,8 +482,10 @@ class TestEnsembleSummaryAggregation:
         assert freq["LIKE_POST"]["total_count"] == 1
 
     def test_sensitivity_reported_with_three_or_more_completed_members(self):
-        _make_source_simulation()
-        record = EnsembleRunner.start_ensemble("sim_source12345", run_count=3)
+        _make_source_simulation(enable_reddit=True, enable_twitter=True)
+        record = EnsembleRunner.start_ensemble(
+            "sim_source12345", run_count=3, platform="parallel"
+        )
         member_ids = [m.simulation_id for m in record.members]
 
         _complete_member(member_ids[0], reddit_actions=10)
@@ -485,6 +496,110 @@ class TestEnsembleSummaryAggregation:
         sensitivity = summary["aggregate"]["metrics"]["reddit_actions_count"]["sensitivity"]
         assert sensitivity is not None
         assert sensitivity > 0
+
+
+def _write_trace_db(member_id, platform, raw_actions):
+    """
+    Writes a <platform>_simulation.db with the same `trace` table schema
+    OASIS itself creates (see .venv/.../oasis/social_platform/sql/trace.sql),
+    populated the way run_twitter_simulation.py/run_reddit_simulation.py
+    actually populate it (one row per action, via pl_utils._record_trace) —
+    unlike run_parallel_simulation.py, these single-platform scripts never
+    mirror it into actions.jsonl.
+    """
+    manager = SimulationManager()
+    member_dir = manager._get_simulation_dir(member_id)
+    db_path = os.path.join(member_dir, f"{platform}_simulation.db")
+    conn = sqlite3.connect(db_path)
+    try:
+        conn.execute(
+            "CREATE TABLE trace (user_id INTEGER, created_at TEXT, action TEXT, info TEXT)"
+        )
+        for user_id, action in raw_actions:
+            conn.execute(
+                "INSERT INTO trace (user_id, created_at, action, info) VALUES (?, ?, ?, ?)",
+                (user_id, "0", action, "{}"),
+            )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+class TestSinglePlatformAggregationReadsTraceDb:
+    """
+    run_twitter_simulation.py/run_reddit_simulation.py never write
+    actions.jsonl (see ensemble_runner.py module docstring point 5), so for
+    platform=twitter/reddit ensembles the aggregate must be computed from
+    the SQLite trace table each script actually populates, not from
+    run_state's action counters (which stay 0 for these platforms) or the
+    actions.jsonl-based _tally_action_types (which finds nothing).
+    """
+
+    def test_reddit_only_aggregate_uses_trace_db_not_run_state_counters(self):
+        _make_source_simulation(enable_reddit=True, enable_twitter=False)
+        record = EnsembleRunner.start_ensemble(
+            "sim_source12345", run_count=2, platform="reddit"
+        )
+        member_ids = [m.simulation_id for m in record.members]
+
+        # run_state's reddit_actions_count/current_round are left at their
+        # defaults (0) here on purpose, exactly as the real
+        # run_reddit_simulation.py + --no-wait leaves them, since that
+        # script never touches those fields.
+        _complete_member(member_ids[0])
+        _complete_member(member_ids[1])
+
+        _write_trace_db(member_ids[0], "reddit", [
+            (1, "create_post"), (1, "like_post"), (2, "refresh"), (2, "sign_up"),
+        ])
+        _write_trace_db(member_ids[1], "reddit", [
+            (1, "create_post"), (1, "create_post"), (2, "do_nothing"),
+        ])
+
+        summary = EnsembleRunner.get_ensemble_summary(record.ensemble_id)
+        aggregate = summary["aggregate"]
+        assert aggregate["completed_run_count"] == 2
+
+        # member 0: create_post + like_post = 2 (refresh/sign_up filtered out)
+        # member 1: create_post*2 + do_nothing = 3
+        reddit_metric = aggregate["metrics"]["reddit_actions_count"]
+        assert reddit_metric["count"] == 2
+        assert reddit_metric["mean"] == 2.5
+        assert reddit_metric["min"] == 2
+        assert reddit_metric["max"] == 3
+
+        twitter_metric = aggregate["metrics"]["twitter_actions_count"]
+        assert twitter_metric["mean"] == 0  # this is a reddit-only ensemble
+
+        # rounds_reached is honestly unavailable for single-platform members
+        # rather than a fabricated 0/total_rounds guess.
+        rounds_metric = aggregate["metrics"]["rounds_reached"]
+        assert rounds_metric["count"] == 0
+        assert rounds_metric["mean"] is None
+
+        freq = aggregate["outcome_frequency"]
+        assert freq["CREATE_POST"]["run_occurrence_count"] == 2
+        assert freq["CREATE_POST"]["total_count"] == 3  # 1 + 2
+        assert freq["LIKE_POST"]["run_occurrence_count"] == 1
+        assert freq["LIKE_POST"]["total_count"] == 1
+        assert freq["DO_NOTHING"]["run_occurrence_count"] == 1
+        assert "REFRESH" not in freq
+        assert "SIGN_UP" not in freq
+
+    def test_missing_trace_db_yields_zero_not_an_error(self):
+        # A completed member whose db file never got created for any reason
+        # must degrade to a zero-count sample, not raise.
+        _make_source_simulation(enable_reddit=True, enable_twitter=False)
+        record = EnsembleRunner.start_ensemble(
+            "sim_source12345", run_count=2, platform="reddit"
+        )
+        for member in record.members:
+            _complete_member(member.simulation_id)
+
+        summary = EnsembleRunner.get_ensemble_summary(record.ensemble_id)
+        aggregate = summary["aggregate"]
+        assert aggregate["metrics"]["reddit_actions_count"]["mean"] == 0
+        assert aggregate["outcome_frequency"] == {}
 
 
 class TestStopEnsemble:
@@ -531,3 +646,62 @@ class TestStopEnsemble:
     def test_stop_missing_ensemble_raises(self):
         with pytest.raises(ValueError, match="不存在"):
             EnsembleRunner.stop_ensemble("ens_doesnotexist")
+
+    def test_stop_called_mid_launch_prevents_remaining_members_from_starting(
+        self, monkeypatch
+    ):
+        # Regression test for the start/stop race: a concurrent stop_ensemble
+        # call sees the provisional record (written before the launch loop)
+        # but can't stop members that don't have a run_state yet. Without the
+        # cancellation flag, start_ensemble's loop would keep launching them
+        # after stop_ensemble already returned "success".
+        _make_source_simulation()
+
+        real_start = SimulationRunner.start_simulation
+        started_member_ids = []
+
+        def fake_stop_simulation(cls, simulation_id):
+            state = SimulationRunner.get_run_state(simulation_id)
+            state.runner_status = RunnerStatus.STOPPED
+            SimulationRunner._save_run_state(state)
+            return state
+
+        def start_and_cancel_after_first_member(cls, *args, **kwargs):
+            simulation_id = kwargs["simulation_id"]
+            started_member_ids.append(simulation_id)
+            result = real_start(*args, **kwargs)
+            if len(started_member_ids) == 1:
+                # Simulate a concurrent /stop request arriving right after
+                # the first member launches, while start_ensemble's loop is
+                # still about to process members 1 and 2.
+                ensemble_id = simulation_id.rsplit("_m", 1)[0]
+                EnsembleRunner.stop_ensemble(ensemble_id)
+            return result
+
+        monkeypatch.setattr(
+            SimulationRunner, "stop_simulation", classmethod(fake_stop_simulation)
+        )
+        monkeypatch.setattr(
+            SimulationRunner, "start_simulation",
+            classmethod(start_and_cancel_after_first_member),
+        )
+
+        record = EnsembleRunner.start_ensemble("sim_source12345", run_count=3)
+
+        # Only the first member actually launched; the rest observed the
+        # cancellation flag before attempting to start and were never
+        # handed to SimulationRunner.start_simulation at all.
+        assert started_member_ids == [record.members[0].simulation_id]
+        assert record.members[0].start_error is None
+        assert record.members[1].start_error is not None
+        assert "取消" in record.members[1].start_error
+        assert record.members[2].start_error is not None
+        assert "取消" in record.members[2].start_error
+
+        # The cancellation is durable: reloading the record still shows it,
+        # and a fresh summary call reflects the already-launched member plus
+        # two cancelled (failed) ones -- never "running" forever.
+        reloaded = EnsembleRunner.get_ensemble_record(record.ensemble_id)
+        assert reloaded.cancelled is True
+        summary = EnsembleRunner.get_ensemble_summary(record.ensemble_id)
+        assert summary["member_counts"]["failed"] == 2
