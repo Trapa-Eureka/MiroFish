@@ -64,6 +64,10 @@ def validate_task_id(task_id) -> str:
     return _validate(task_id, "task_id")
 
 
+def validate_ensemble_id(ensemble_id) -> str:
+    return _validate(ensemble_id, "ensemble_id")
+
+
 def validate_platform_name(platform) -> str:
     if platform not in _ALLOWED_PLATFORMS:
         raise InvalidIdentifierError(
