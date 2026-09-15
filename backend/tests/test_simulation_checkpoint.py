@@ -199,6 +199,55 @@ class TestCheckpointApiEndpoint:
         response = client.get("/api/simulation/sim_nope12345/checkpoint")
         assert response.status_code == 404
 
+    def test_get_checkpoint_prefers_live_run_state_over_stale_persisted_file(
+        self, tmp_path, monkeypatch
+    ):
+        """
+        Regression test for Codex's round-8 finding: run_state.json and
+        checkpoint.json are written in two separate calls, so a process
+        killed between them can leave checkpoint.json behind describing an
+        earlier, non-terminal snapshot even though run_state.json (which is
+        itself crash-safe) already reflects the true terminal outcome. The
+        endpoint must reconcile by preferring the live run_state.json.
+        """
+        simulation_id = "sim_racewindow12"
+        monkeypatch.setattr(SimulationRunner, "RUN_STATE_DIR", str(tmp_path))
+        sim_dir = tmp_path / simulation_id
+        sim_dir.mkdir()
+
+        # Simulate the crash window: run_state.json already made it to a
+        # terminal FAILED status at round 42, but checkpoint.json is stuck
+        # at an earlier RUNNING snapshot from before the crash.
+        SimulationRunner._save_run_state(
+            SimulationRunState(
+                simulation_id=simulation_id,
+                runner_status=RunnerStatus.FAILED,
+                total_rounds=100,
+                twitter_current_round=42,
+                error="进程退出码: 1",
+            )
+        )
+        save_checkpoint(
+            str(sim_dir),
+            Checkpoint(
+                simulation_id=simulation_id,
+                twitter_round=10,
+                total_rounds=100,
+                runner_status="running",
+            ),
+        )
+
+        app = create_app()
+        app.config.update(TESTING=True)
+        client = app.test_client()
+
+        response = client.get(f"/api/simulation/{simulation_id}/checkpoint")
+        assert response.status_code == 200
+        # Must reflect the authoritative, crash-safe run_state.json -- not
+        # the stale checkpoint.json left behind from before the crash.
+        assert response.json["data"]["runner_status"] == "failed"
+        assert response.json["data"]["twitter_round"] == 42
+
 
 class TestPerPlatformCheckpointFreshness:
     """

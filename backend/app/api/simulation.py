@@ -1430,8 +1430,21 @@ def get_simulation_checkpoint(simulation_id: str):
     try:
         from ..services import simulation_checkpoint
 
-        sim_dir = SimulationRunner._get_sim_dir(simulation_id)
-        checkpoint = simulation_checkpoint.load_checkpoint(sim_dir)
+        # run_state.json 和 checkpoint.json 是分两次写入的：进程完全可能
+        # 在把 run_state.json 落到终态之后、写 checkpoint.json 之前被杀死，
+        # 这会让磁盘上单独持久化的检查点文件落后于真正的终态。
+        # run_state.json 本身已经是崩溃安全的（原子写入 + 进程重启后可恢复，
+        # 见 TASK 4/5），所以只要它存在，就始终优先从它实时构建检查点视图，
+        # 而不是信任可能滞后的 checkpoint.json——这样可以完全规避这个
+        # 不一致窗口，而不需要让两次写入变成一次事务。
+        run_state = SimulationRunner.get_run_state(simulation_id)
+        if run_state is not None:
+            checkpoint = simulation_checkpoint.build_checkpoint_from_state(run_state).to_dict()
+        else:
+            # 该模拟从未真正启动过运行（没有 run_state.json）时，退回到读取
+            # 磁盘上持久化的检查点文件（通常此时也不存在，会走到下面的 404）。
+            sim_dir = SimulationRunner._get_sim_dir(simulation_id)
+            checkpoint = simulation_checkpoint.load_checkpoint(sim_dir)
 
         if not checkpoint:
             return jsonify({
