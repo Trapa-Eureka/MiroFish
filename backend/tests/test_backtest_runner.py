@@ -92,6 +92,13 @@ def _make_completed_ensemble(
     test_ensemble_runner.py). member_statuses, if given, is a list of
     RunnerStatus values (one per member index) overriding the default
     COMPLETED for that member."""
+    _RUNNER_TO_SIMULATION_STATUS = {
+        RunnerStatus.COMPLETED: SimulationStatus.COMPLETED,
+        RunnerStatus.RUNNING: SimulationStatus.RUNNING,
+        RunnerStatus.FAILED: SimulationStatus.FAILED,
+        RunnerStatus.STOPPED: SimulationStatus.STOPPED,
+    }
+    manager = SimulationManager()
     members = []
     for index in range(member_count):
         member_id = f"{ensemble_id}_m{index}"
@@ -103,6 +110,12 @@ def _make_completed_ensemble(
         SimulationRunner._save_run_state(
             SimulationRunState(simulation_id=member_id, runner_status=status)
         )
+        manager._save_simulation_state(SimulationState(
+            simulation_id=member_id,
+            project_id=project_id,
+            graph_id="graph-test-1",
+            status=_RUNNER_TO_SIMULATION_STATUS.get(status, SimulationStatus.CREATED),
+        ))
         members.append(EnsembleMemberRecord(simulation_id=member_id, index=index))
 
     record = EnsembleRecord(
@@ -337,6 +350,41 @@ class TestCreateBacktestValidation:
                 source_simulation_id="sim_source12345",
             )
 
+    def test_unknown_prediction_field_rejected(self):
+        # A typo (e.g. "direciton" instead of "direction") must be
+        # rejected up front, not silently dropped by from_dict's .get(...)
+        # -- which would leave the intended field as None with no error.
+        _make_completed_simulation()
+        with pytest.raises(ValueError, match="无法识别"):
+            BacktestRunner.create_backtest(
+                scenario_description="x", t0_cutoff="2024-01-01",
+                prediction={"occurred": True, "direciton": "up"},
+                source_simulation_id="sim_source12345",
+            )
+
+    def test_unknown_ground_truth_field_rejected_before_consuming_claim(self):
+        # Even more important than the prediction-side case: ground truth
+        # is one-shot and immutable, so a typo here would otherwise be
+        # permanently unrecoverable. Must be rejected before the exclusive
+        # claim is created, so a corrected retry is still possible.
+        _make_completed_simulation()
+        case = BacktestRunner.create_backtest(
+            scenario_description="x", t0_cutoff="2024-01-01",
+            prediction={"occurred": True, "direction": "up"},
+            source_simulation_id="sim_source12345",
+        )
+        with pytest.raises(ValueError, match="无法识别"):
+            BacktestRunner.record_ground_truth(
+                case.backtest_id, {"occurred": True, "direciton": "up"}
+            )
+
+        # The claim must not have been consumed -- a corrected resubmission
+        # still succeeds.
+        result = BacktestRunner.record_ground_truth(
+            case.backtest_id, {"occurred": True, "direction": "up"}
+        )
+        assert result.metrics["direction_correct"] is True
+
     def test_nan_rank_rejected(self):
         _make_completed_simulation()
         with pytest.raises(ValueError, match="rank"):
@@ -561,6 +609,38 @@ class TestCreateBacktestHappyPath:
                 scenario_description="x", t0_cutoff="2024-01-01",
                 prediction={"occurred": True},
                 source_simulation_id="sim_source12345",
+            )
+
+    def test_reprepared_source_simulation_rejected_despite_stale_completed_run_state(self):
+        # Regression test: /api/simulation/prepare with force_regenerate=True
+        # can regenerate a COMPLETED simulation's profiles/config in place,
+        # moving SimulationState.status to PREPARING/READY -- but it never
+        # touches run_state.json, which still shows the previous run's
+        # COMPLETED status. run_state alone can't detect this; the
+        # SimulationState.status check must catch it.
+        _make_completed_simulation()
+        state = SimulationManager().get_simulation("sim_source12345")
+        state.status = SimulationStatus.READY
+        SimulationManager()._save_simulation_state(state)
+
+        with pytest.raises(ValueError, match="尚未成功完成"):
+            BacktestRunner.create_backtest(
+                scenario_description="x", t0_cutoff="2024-01-01",
+                prediction={"occurred": True},
+                source_simulation_id="sim_source12345",
+            )
+
+    def test_reprepared_ensemble_member_rejected_despite_stale_completed_run_state(self):
+        _make_completed_ensemble(member_count=1)
+        member_state = SimulationManager().get_simulation("ens_source1234_m0")
+        member_state.status = SimulationStatus.PREPARING
+        SimulationManager()._save_simulation_state(member_state)
+
+        with pytest.raises(ValueError, match="尚未成功完成"):
+            BacktestRunner.create_backtest(
+                scenario_description="x", t0_cutoff="2024-01-01",
+                prediction={"occurred": True},
+                source_ensemble_id="ens_source1234",
             )
 
     def test_ensemble_member_restarted_after_stale_summary_is_rejected(self):

@@ -91,7 +91,7 @@ from typing import Any, Dict, List, Optional, Tuple
 from ..utils.logger import get_logger
 from ..utils.id_validation import validate_backtest_id, safe_join
 from ..utils.state_machine import atomic_write_json
-from .simulation_manager import SimulationManager
+from .simulation_manager import SimulationManager, SimulationStatus
 from .simulation_runner import SimulationRunner, RunnerStatus
 from .ensemble_runner import EnsembleRunner
 
@@ -103,6 +103,19 @@ BACKTEST_FILENAME = "backtest.json"
 # 共享一个可打分的维度"；rank 不在这里——它只贡献给套件级别的排名相关性，
 # 不产生单 case 指标，所以单独校验。
 _COMPARABLE_SCALAR_FIELDS = ("occurred", "direction", "sentiment")
+
+# Prediction.from_dict/GroundTruth.from_dict 对不认识的键（比如拼错的
+# "direciton"）不会报错——dataclass 的 from_dict 只是 .get(...) 对应字段，
+# 多余的键会被直接忽略。如果不在这里显式拒绝，一次提交里的拼写错误会
+# 悄悄地让某个字段永远是 None（未被识别），而不是报错——对 prediction
+# 这只是发现得晚；对 ground_truth 则是永久性的，因为它一次性、不可变，
+# 提交之后没有第二次机会去补救这个被吞掉的字段。
+_PREDICTION_ALLOWED_FIELDS = frozenset(
+    {"occurred", "probability", "direction", "sentiment", "rank", "distribution"}
+)
+_GROUND_TRUTH_ALLOWED_FIELDS = frozenset(
+    {"occurred", "direction", "sentiment", "rank", "distribution"}
+)
 
 
 @dataclass
@@ -397,9 +410,26 @@ class BacktestRunner:
 
         if source_simulation_id is not None:
             manager = SimulationManager()
+            # SimulationManager 没有内存缓存，每次都直接读盘，不需要
+            # force_reload 这类机制。
             state = manager.get_simulation(source_simulation_id)
             if state is None:
                 raise ValueError(f"来源模拟不存在: {source_simulation_id}")
+            # /api/simulation/prepare 支持 force_regenerate=True，可以对一个
+            # 已经 COMPLETED 的模拟原地重新生成人设/配置——这会把
+            # SimulationState.status 改成 PREPARING/READY，但完全不会去碰
+            # SimulationRunner 自己的 run_state.json（那是另一个文件，由
+            # 另一个模块管理），所以仅凭 run_state.runner_status ==
+            # COMPLETED 侦测不到"这次预测依据的输入（人设/配置）已经被
+            # 重新生成过、不再是原来那一次运行真正用过的输入"这种情况。
+            # state.status 才是"这个模拟当前处于什么阶段"的权威来源；
+            # 只有它也确认是 COMPLETED（而不是重新准备后又停在
+            # PREPARING/READY，还没被重新 START）时，才信任 run_state.json
+            # 里的那份历史 COMPLETED 快照。
+            if state.status != SimulationStatus.COMPLETED:
+                raise ValueError(
+                    f"来源模拟尚未成功完成，无法作为回测预测依据: {source_simulation_id}"
+                )
             # force_reload=True：这是一次要把结果永久锁定成回测证据的
             # 资格判断，不能信任本进程可能过期的内存缓存——在多 worker
             # 部署下，另一个进程完全可能已经把这个 simulation_id 重新
@@ -448,6 +478,7 @@ class BacktestRunner:
             #   归类为已取消的终态失败，而不是"未知"；这里必须用同样的
             #   逻辑对待它，否则一个 summary 认为完全可以打分的集成会在
             #   这里被误判为"缺状态、需要拒绝"。
+            manager = SimulationManager()
             member_snapshots = []
             for member in record.members:
                 if member.start_error is not None:
@@ -465,6 +496,16 @@ class BacktestRunner:
                     RunnerStatus.FAILED, RunnerStatus.STOPPED
                 ):
                     continue
+                # 与单次模拟来源同样的道理：成员本质上就是一个普通的
+                # SimulationState，同样可以被 /api/simulation/prepare
+                # (force_regenerate=True) 原地重新生成人设/配置而不清空
+                # 它的 run_state.json。
+                member_state = manager.get_simulation(member.simulation_id)
+                if member_state is None or member_state.status != SimulationStatus.COMPLETED:
+                    raise ValueError(
+                        f"来源集成尚未成功完成，无法作为回测预测依据: {source_ensemble_id}"
+                        f"（成员 {member.simulation_id} 的输入可能已被重新生成）"
+                    )
                 if member_run_state.runner_status != RunnerStatus.COMPLETED:
                     raise ValueError(
                         f"来源集成尚未成功完成，无法作为回测预测依据: {source_ensemble_id}"
@@ -626,10 +667,20 @@ class BacktestRunner:
 
         return metrics
 
+    @staticmethod
+    def _reject_unknown_fields(data: Dict[str, Any], allowed: frozenset, label: str) -> None:
+        unknown = set(data.keys()) - allowed
+        if unknown:
+            raise ValueError(
+                f"{label} 包含无法识别的字段: {sorted(unknown)}（可能是拼写错误；"
+                f"支持的字段为: {sorted(allowed)}）"
+            )
+
     @classmethod
     def _parse_prediction(cls, data: Dict[str, Any]) -> Prediction:
         if not isinstance(data, dict):
             raise ValueError("prediction 必须是一个 JSON 对象")
+        cls._reject_unknown_fields(data, _PREDICTION_ALLOWED_FIELDS, "prediction")
         prediction = Prediction.from_dict(data)
         cls._validate_scalar_fields(prediction.occurred, prediction.direction, prediction.sentiment)
         if prediction.probability is not None:
@@ -655,6 +706,7 @@ class BacktestRunner:
     def _parse_ground_truth(cls, data: Dict[str, Any]) -> GroundTruth:
         if not isinstance(data, dict):
             raise ValueError("ground_truth 必须是一个 JSON 对象")
+        cls._reject_unknown_fields(data, _GROUND_TRUTH_ALLOWED_FIELDS, "ground_truth")
         ground_truth = GroundTruth.from_dict(data)
         cls._validate_scalar_fields(
             ground_truth.occurred, ground_truth.direction, ground_truth.sentiment
