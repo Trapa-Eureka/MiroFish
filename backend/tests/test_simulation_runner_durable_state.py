@@ -213,57 +213,53 @@ class TestForceReload:
         assert SimulationRunner.get_run_state(sim_id).runner_status == RunnerStatus.RUNNING
         reloaded = SimulationRunner.get_run_state(sim_id, force_reload=True)
         assert reloaded.runner_status == RunnerStatus.COMPLETED
-        assert SimulationRunner.get_run_state(sim_id).runner_status == RunnerStatus.COMPLETED
 
-    def test_force_reload_does_not_regress_a_newer_cached_state(self):
-        # Regression test: force_reload racing a same-process finalizer
-        # must never let an older on-disk read overwrite (or be returned
-        # in place of) a newer state that's already in the cache --
-        # otherwise every subsequent non-force_reload caller in this
-        # process (status polling, restart eligibility, etc.) would be
-        # permanently stuck observing the older status.
+    def test_force_reload_never_writes_back_to_the_shared_cache(self):
+        # Regression test: _run_states holds the *same mutable object*
+        # that callers (e.g. the monitor thread) mutate in place before
+        # calling _save_run_state -- "revision" on that cached object can
+        # reflect pending, not-yet-persisted field changes, and
+        # _save_run_state can bump the cached revision before the disk
+        # write it's tied to has actually succeeded. No revision-based
+        # comparison between a force_reload disk read and the cache can
+        # safely decide "which one is newer" given that. So force_reload
+        # must be read-only with respect to the cache: it never writes to
+        # _run_states at all, regardless of what it reads from disk --
+        # leaving cache freshness entirely up to _save_run_state's normal
+        # write path.
         sim_id = "sim_forcereload2"
         state = _state(sim_id, RunnerStatus.STARTING)
         SimulationRunner._save_run_state(state)
         state.runner_status = RunnerStatus.RUNNING
-        SimulationRunner._save_run_state(state)  # cache: RUNNING/rev2, disk: RUNNING/rev2
+        SimulationRunner._save_run_state(state)  # cache holds this exact object, rev 2
 
-        # Simulate get_run_state(force_reload=True) having already read a
-        # stale disk snapshot (RUNNING/rev2) into a local variable, and
-        # THEN -- before it writes that snapshot into the cache -- this
-        # same process's finalizer races ahead and persists COMPLETED/rev3
-        # (updating the cache too, exactly like _save_run_state always
-        # does). We reproduce that ordering directly against the cache
-        # dict rather than the disk file, since disk mtime granularity
-        # can't reliably force a real race window in a fast unit test.
-        stale_read = SimulationRunState(
-            simulation_id=sim_id, runner_status=RunnerStatus.RUNNING, revision=2
-        )
-        state.runner_status = RunnerStatus.STOPPING
+        cached_object_before = SimulationRunner._run_states[sim_id]
+
+        # A force_reload call, regardless of what it finds on disk, must
+        # not touch the cache.
+        SimulationRunner.get_run_state(sim_id, force_reload=True)
+
+        assert SimulationRunner._run_states[sim_id] is cached_object_before
+        assert SimulationRunner.get_run_state(sim_id).runner_status == RunnerStatus.RUNNING
+
+    def test_force_reload_does_not_clobber_an_in_place_mutation_pending_save(self):
+        # The exact failure mode this design avoids: a caller (e.g. the
+        # monitor thread) fetches the cached object and starts mutating it
+        # in place (as this codebase's call sites do) before its own
+        # _save_run_state call. A concurrent force_reload happening in
+        # that window must not leave the shared cache pointing at a
+        # disk-read object that lacks those pending mutations.
+        sim_id = "sim_forcereload3"
+        state = _state(sim_id, RunnerStatus.STARTING)
         SimulationRunner._save_run_state(state)
-        state.runner_status = RunnerStatus.STOPPED
-        SimulationRunner._save_run_state(state)  # cache: STOPPED/rev4 (newer than stale_read)
 
-        cached_before = SimulationRunner._run_states[sim_id]
-        assert cached_before.revision == 4
+        live = SimulationRunner.get_run_state(sim_id)
+        live.current_round = 42  # pending, unsaved in-place mutation
 
-        # Directly exercise the revision-comparison branch get_run_state
-        # applies after loading from disk, using the stale snapshot as
-        # the "disk read" result.
-        import app.services.simulation_runner as runner_module
+        SimulationRunner.get_run_state(sim_id, force_reload=True)
 
-        original_load = runner_module.SimulationRunner._load_run_state
-        runner_module.SimulationRunner._load_run_state = classmethod(
-            lambda cls, _sim_id: stale_read
-        )
-        try:
-            result = SimulationRunner.get_run_state(sim_id, force_reload=True)
-        finally:
-            runner_module.SimulationRunner._load_run_state = original_load
-
-        assert result.runner_status == RunnerStatus.STOPPED
-        assert result.revision == 4
-        assert SimulationRunner._run_states[sim_id].revision == 4
+        assert SimulationRunner._run_states[sim_id] is live
+        assert SimulationRunner._run_states[sim_id].current_round == 42
 
 
 def test_raw_file_contains_expected_shape(tmp_path):

@@ -363,33 +363,34 @@ class SimulationRunner:
         "COMPLETED" 可能只是历史快照——同一个 simulation_id 完全可以在
         另一个 worker 进程里被重新启动过，磁盘上的 run_state.json 早已
         变成 STARTING/RUNNING，本进程的缓存却还没有任何理由去刷新。
-        force_reload=True 会跳过缓存、强制从磁盘重新读取（读到的新值
-        仍然会顺带刷新缓存，不会让缓存和磁盘更久地不一致）。
+        force_reload=True 会跳过缓存、强制从磁盘重新读取，把这一次读到
+        的结果直接返回给调用方。
 
-        force_reload 读盘的过程中，本进程自己的另一个线程完全可能正好在
-        这中间完成了一次更新（例如监控线程刚把状态从 RUNNING 推进到
-        COMPLETED，revision 也随之递增，并已经把新状态写回了缓存）——这
-        时磁盘上读到的可能反而是一份更旧的快照。不比较 revision、无条件
-        用读盘结果覆盖缓存的话，会把缓存从"更新的 COMPLETED"倒退回
-        "更旧的 RUNNING"，而且这个回退会一直留在缓存里，让后续所有不带
-        force_reload 的正常调用方（状态轮询、重启校验等）都被这份错误的
-        倒退数据污染，看起来"永远在跑"。因此这里只在读到的 revision 不
-        低于当前缓存时才用它覆盖缓存；否则缓存里更新的那份状态才是权威
-        的，直接把它返回给调用方，而不是返回这份更旧的读数。
+        force_reload 的读盘结果特意不会被写回 cls._run_states：这个缓存
+        里存的不是不可变快照，而是调用方（例如监控线程）在调用
+        _save_run_state 持久化之前，会直接原地修改的同一个对象引用——
+        意味着"revision 相同"不代表"内容相同"（缓存里可能已经有了还没
+        持久化的最新字段修改），"revision 更大"也不代表"已经落盘成功"
+        （_save_run_state 在磁盘写入真正完成之前就可能已经把 revision
+        递增并更新了缓存）。用一次 force_reload 读盘的结果去覆盖这份
+        缓存，无论按 revision 大小做何种比较，都有可能把一份还没保存的
+        原地修改覆盖掉，或者反过来让缓存里出现一份从未真正落盘、下次
+        进程重启就会消失的"幽灵"状态——而这份缓存会被其余所有不带
+        force_reload 的正常调用方（状态轮询、重启校验、监控线程自己）
+        长期依赖。因此 force_reload 只读、不写：它只为这一次调用提供一份
+        当下最准确的磁盘快照，完全不触碰共享缓存，把"缓存该在什么时候
+        更新"这个决定完整留给 _save_run_state 自己的正常写入路径。
         """
         if not force_reload and simulation_id in cls._run_states:
             return cls._run_states[simulation_id]
 
+        if force_reload:
+            return cls._load_run_state(simulation_id)
+
         # 尝试从文件加载
         state = cls._load_run_state(simulation_id)
-        if state is None:
-            return None
-
-        cached = cls._run_states.get(simulation_id)
-        if cached is not None and cached.revision > state.revision:
-            return cached
-
-        cls._run_states[simulation_id] = state
+        if state:
+            cls._run_states[simulation_id] = state
         return state
     
     @classmethod
