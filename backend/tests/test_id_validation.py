@@ -14,6 +14,7 @@ from app.utils.id_validation import (
     InvalidIdentifierError,
     PathContainmentError,
     safe_join,
+    validate_ensemble_id,
     validate_graph_id,
     validate_platform_name,
     validate_project_id,
@@ -57,7 +58,13 @@ TRAVERSAL_PAYLOADS = [
 @pytest.mark.parametrize("value", VALID_IDS)
 @pytest.mark.parametrize(
     "validator",
-    [validate_project_id, validate_simulation_id, validate_report_id, validate_graph_id],
+    [
+        validate_project_id,
+        validate_simulation_id,
+        validate_report_id,
+        validate_graph_id,
+        validate_ensemble_id,
+    ],
 )
 def test_valid_identifiers_pass(validator, value):
     assert validator(value) == value
@@ -66,7 +73,13 @@ def test_valid_identifiers_pass(validator, value):
 @pytest.mark.parametrize("payload", TRAVERSAL_PAYLOADS)
 @pytest.mark.parametrize(
     "validator",
-    [validate_project_id, validate_simulation_id, validate_report_id, validate_graph_id],
+    [
+        validate_project_id,
+        validate_simulation_id,
+        validate_report_id,
+        validate_graph_id,
+        validate_ensemble_id,
+    ],
 )
 def test_malicious_identifiers_rejected(validator, payload):
     with pytest.raises(InvalidIdentifierError):
