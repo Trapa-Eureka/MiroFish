@@ -534,6 +534,17 @@ class SimulationRunner:
             ) or ZepGraphMemoryManager.get_updater(simulation_id) is not None:
                 raise ValueError(f"模拟已在运行或结束处理中: {simulation_id}")
             cls._save_run_state(state)
+
+            # 这里是"新一轮运行已确定接管该 simulation_id"的唯一节点，
+            # 覆盖了后续所有可能的启动失败路径（Zep 更新器创建失败、脚本
+            # 缺失、进程启动失败等）。此时必须让检查点反映新一轮运行，
+            # 而不是让 API 继续返回上一轮运行遗留的旧检查点。
+            try:
+                simulation_checkpoint.save_checkpoint(
+                    sim_dir, simulation_checkpoint.build_checkpoint_from_state(state)
+                )
+            except Exception:
+                logger.exception(f"重置检查点失败: simulation_id={simulation_id}")
         
         # 如果启用图谱记忆更新，创建更新器
         if enable_graph_memory_update:
@@ -732,7 +743,11 @@ class SimulationRunner:
         
         twitter_position = 0
         reddit_position = 0
-        last_checkpoint_round = -1
+        # 记录各平台"轮次 + 动作数"的组合签名，而不是只看跨平台聚合的
+        # current_round——并行双平台运行时，一个平台卡在某一轮、另一个
+        # 平台持续推进（或同一轮内动作数增加）不会反映在聚合轮次上，
+        # 仅比较 current_round 会让检查点在这种情况下停留在过期数据。
+        last_checkpoint_signature = None
 
         monitor_error: Exception | None = None
         exit_code: int | None = None
@@ -753,14 +768,21 @@ class SimulationRunner:
                 # 更新状态
                 cls._save_run_state(state)
 
-                # 每当轮次前进时记录一次检查点（记录"跑到哪儿了"，不代表可
-                # 真正从该点续跑——见 simulation_checkpoint.py 模块说明）
-                if state.current_round > last_checkpoint_round:
+                # 每当任一平台的轮次或动作数发生变化时记录一次检查点
+                # （记录"跑到哪儿了"，不代表可真正从该点续跑——见
+                # simulation_checkpoint.py 模块说明）
+                checkpoint_signature = (
+                    state.twitter_current_round,
+                    state.reddit_current_round,
+                    state.twitter_actions_count,
+                    state.reddit_actions_count,
+                )
+                if checkpoint_signature != last_checkpoint_signature:
                     try:
                         simulation_checkpoint.save_checkpoint(
                             sim_dir, simulation_checkpoint.build_checkpoint_from_state(state)
                         )
-                        last_checkpoint_round = state.current_round
+                        last_checkpoint_signature = checkpoint_signature
                     except Exception:
                         logger.exception(f"保存检查点失败: simulation_id={simulation_id}")
 

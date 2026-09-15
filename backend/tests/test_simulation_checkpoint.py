@@ -197,3 +197,164 @@ class TestCheckpointApiEndpoint:
 
         response = client.get("/api/simulation/sim_nope12345/checkpoint")
         assert response.status_code == 404
+
+
+class TestPerPlatformCheckpointFreshness:
+    """
+    Regression test for Codex's finding: comparing only the cross-platform
+    aggregate `current_round` misses progress on the platform that is behind
+    (its round/action count can change without the aggregate changing), so a
+    crash could report stale per-platform progress. Checkpoints must react
+    to per-platform round/action changes too.
+    """
+
+    def _write_round_end(self, log_path, round_num, simulated_hours=1):
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(log_path, "a", encoding="utf-8") as f:
+            f.write(
+                json.dumps(
+                    {
+                        "event_type": "round_end",
+                        "round": round_num,
+                        "simulated_hours": simulated_hours,
+                    }
+                )
+                + "\n"
+            )
+
+    def test_checkpoint_updates_when_lagging_platform_advances(self, tmp_path, monkeypatch):
+        simulation_id = "sim_perplat1234"
+        sim_dir = tmp_path / simulation_id
+        twitter_log = sim_dir / "twitter" / "actions.jsonl"
+        reddit_log = sim_dir / "reddit" / "actions.jsonl"
+        # Twitter starts ahead; the aggregate current_round becomes 5 and
+        # will NOT change when reddit later advances to round 3 (3 < 5).
+        self._write_round_end(twitter_log, round_num=5)
+
+        state = SimulationRunState(
+            simulation_id=simulation_id,
+            runner_status=RunnerStatus.RUNNING,
+            total_rounds=100,
+            twitter_running=True,
+            reddit_running=True,
+        )
+
+        monkeypatch.setattr(SimulationRunner, "RUN_STATE_DIR", str(tmp_path))
+        monkeypatch.setattr(SimulationRunner, "_run_states", {simulation_id: state})
+        monkeypatch.setattr(SimulationRunner, "_processes", {})
+        monkeypatch.setattr(SimulationRunner, "_manual_stop_requests", set())
+        monkeypatch.setattr(SimulationRunner, "_graph_memory_enabled", {})
+        monkeypatch.setattr(
+            SimulationRunner, "_sync_simulation_status", classmethod(lambda *a, **k: None)
+        )
+
+        checkpoints_seen = []
+        real_save = simulation_checkpoint.save_checkpoint
+
+        def spy_save(sim_dir_arg, cp):
+            checkpoints_seen.append((cp.twitter_round, cp.reddit_round))
+            real_save(sim_dir_arg, cp)
+
+        monkeypatch.setattr(runner_module.simulation_checkpoint, "save_checkpoint", spy_save)
+
+        sleep_calls = {"n": 0}
+
+        def fake_sleep(_):
+            sleep_calls["n"] += 1
+            if sleep_calls["n"] == 1:
+                # Simulate reddit making progress on the next monitor tick,
+                # while the aggregate current_round (5) stays unchanged.
+                self._write_round_end(reddit_log, round_num=3)
+
+        monkeypatch.setattr(runner_module.time, "sleep", fake_sleep)
+
+        poll_results = iter([None, None, 0])
+
+        class FakeProcess:
+            pid = 1
+            returncode = 0
+
+            def poll(self):
+                return next(poll_results, 0)
+
+        SimulationRunner._processes[simulation_id] = FakeProcess()
+
+        SimulationRunner._monitor_simulation(simulation_id, locale="zh")
+
+        assert state.current_round == 5  # aggregate never moved past twitter's round
+        # But both distinct per-platform snapshots were still checkpointed.
+        assert (5, 0) in checkpoints_seen
+        assert (5, 3) in checkpoints_seen
+
+
+class TestStartSimulationResetsStaleCheckpoint:
+    def test_start_simulation_clears_previous_run_checkpoint(self, tmp_path, monkeypatch):
+        simulation_id = "sim_startreset1"
+        sim_dir = tmp_path / "runs" / simulation_id
+        scripts_dir = tmp_path / "scripts"
+        sim_dir.mkdir(parents=True)
+        scripts_dir.mkdir()
+        (sim_dir / "simulation_config.json").write_text(
+            json.dumps({
+                "time_config": {"total_simulation_hours": 1, "minutes_per_round": 60},
+            }),
+            encoding="utf-8",
+        )
+        (scripts_dir / "run_twitter_simulation.py").write_text("pass\n", encoding="utf-8")
+
+        # Stale checkpoint left over from a previous (already-finished) run.
+        save_checkpoint(
+            str(sim_dir),
+            Checkpoint(
+                simulation_id=simulation_id,
+                twitter_round=42,
+                total_rounds=50,
+                runner_status="completed",
+            ),
+        )
+
+        class Process:
+            pid = 123
+
+            def poll(self):
+                return None
+
+        class BrokenThread:
+            def __init__(self, **_kwargs):
+                pass
+
+            def start(self):
+                raise RuntimeError("monitor failed")
+
+        monkeypatch.setattr(SimulationRunner, "RUN_STATE_DIR", str(tmp_path / "runs"))
+        monkeypatch.setattr(SimulationRunner, "SCRIPTS_DIR", str(scripts_dir))
+        monkeypatch.setattr(runner_module.subprocess, "Popen", lambda *_a, **_k: Process())
+        monkeypatch.setattr(runner_module.threading, "Thread", BrokenThread)
+        monkeypatch.setattr(
+            SimulationRunner,
+            "_terminate_process",
+            classmethod(lambda _cls, _process, sim_id: None),
+        )
+        monkeypatch.setattr(
+            SimulationRunner, "_sync_simulation_status", classmethod(lambda *a, **k: None)
+        )
+
+        try:
+            with pytest.raises(RuntimeError, match="monitor failed"):
+                SimulationRunner.start_simulation(
+                    simulation_id, platform="twitter", enable_graph_memory_update=False
+                )
+
+            # Even though startup failed after the claim, the checkpoint must
+            # already reflect the NEW run (round 0, starting) rather than the
+            # previous run's stale round=42/completed snapshot.
+            checkpoint = load_checkpoint(str(sim_dir))
+            assert checkpoint["twitter_round"] == 0
+            assert checkpoint["runner_status"] == "starting"
+        finally:
+            SimulationRunner._run_states.pop(simulation_id, None)
+            SimulationRunner._processes.pop(simulation_id, None)
+            SimulationRunner._action_queues.pop(simulation_id, None)
+            SimulationRunner._stdout_files.pop(simulation_id, None)
+            SimulationRunner._stderr_files.pop(simulation_id, None)
+            SimulationRunner._graph_memory_enabled.pop(simulation_id, None)
