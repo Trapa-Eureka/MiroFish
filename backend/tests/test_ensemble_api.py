@@ -157,6 +157,41 @@ class TestStartEnsembleRoute:
         assert response.status_code == 400
         assert response.json["success"] is False
 
+    def test_start_rejects_non_object_json_body(self, client):
+        # get_json(silent=True) happily decodes valid-but-non-object JSON
+        # (a list here) without raising; the "or {}" idiom only rescues a
+        # falsy/None result, so a plain .get(...) on a list would otherwise
+        # raise AttributeError and surface as a 500.
+        response = client.post("/api/ensemble/start", json=[1, 2, 3])
+        assert response.status_code == 400
+        assert response.json["success"] is False
+
+    def test_start_rejects_fractional_max_rounds(self, client):
+        _make_source_simulation()
+        response = client.post(
+            "/api/ensemble/start",
+            json={
+                "source_simulation_id": "sim_source12345",
+                "run_count": 2,
+                "max_rounds": 2.9,
+            },
+        )
+        assert response.status_code == 400
+
+    def test_start_rejects_boolean_max_rounds(self, client):
+        # isinstance(True, int) is True in Python, so a naive int(x) check
+        # would silently accept this and run int(True) == 1 round.
+        _make_source_simulation()
+        response = client.post(
+            "/api/ensemble/start",
+            json={
+                "source_simulation_id": "sim_source12345",
+                "run_count": 2,
+                "max_rounds": True,
+            },
+        )
+        assert response.status_code == 400
+
     def test_start_happy_path_returns_members(self, client):
         _make_source_simulation()
         response = client.post(
@@ -222,6 +257,11 @@ class TestStopEnsembleRoute:
             data="{not valid json",
             content_type="application/json",
         )
+        assert response.status_code == 400
+        assert response.json["success"] is False
+
+    def test_stop_rejects_non_object_json_body(self, client):
+        response = client.post("/api/ensemble/stop", json="not-an-object")
         assert response.status_code == 400
         assert response.json["success"] is False
 

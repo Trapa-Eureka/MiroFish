@@ -488,6 +488,45 @@ class EnsembleRunner:
             )
 
         final_on_disk = cls.get_ensemble_record(ensemble_id)
+        # 循环里最后一轮的落盘失败（这是"尽力而为"设计本身允许发生的，见上面
+        # 每轮写入的 except 分支）意味着磁盘上停留的还是上一轮的快照——对
+        # 最后一个成员来说，那份快照里它还是"从未尝试"的占位状态
+        # （start_error=None、没有 run_state），而循环已经结束，不会再有
+        # 下一轮来修正它，summary 就会把它永远归为 starting。这里再补一次
+        # 尽力而为的写入，把已知的完整 members 列表落盘；如果这次还失败，
+        # 就只能如实记录失败，不再无限重试。
+        final_members_match = bool(
+            final_on_disk
+            and [m.to_dict() for m in final_on_disk.members]
+            == [m.to_dict() for m in members]
+        )
+        if not final_members_match:
+            with cls._ensemble_lock(ensemble_id):
+                try:
+                    latest_on_disk = cls.get_ensemble_record(ensemble_id)
+                    atomic_write_json(
+                        cls._ensemble_path(ensemble_id),
+                        EnsembleRecord(
+                            ensemble_id=ensemble_id,
+                            source_simulation_id=source_simulation_id,
+                            project_id=source_state.project_id,
+                            graph_id=source_state.graph_id,
+                            platform=resolved_platform,
+                            max_rounds=max_rounds,
+                            run_count=run_count,
+                            members=members,
+                            created_at=provisional_record.created_at,
+                            owner_id=source_state.owner_id,
+                            cancelled=bool(latest_on_disk and latest_on_disk.cancelled),
+                        ).to_dict(),
+                    )
+                    final_on_disk = cls.get_ensemble_record(ensemble_id)
+                except Exception:
+                    logger.exception(
+                        f"补写集成最终记录失败（成员已启动，磁盘上的记录可能仍"
+                        f"停留在启动循环中途的快照）: ensemble_id={ensemble_id}"
+                    )
+
         return EnsembleRecord(
             ensemble_id=ensemble_id,
             source_simulation_id=source_simulation_id,
@@ -525,6 +564,7 @@ class EnsembleRunner:
         # 真正发布 run_state 之前运行的窄窗口——那种情况下 stop_ensemble
         # 找不到该成员的 run_state 而跳过它，随后启动循环仍会把它启动
         # 起来。持锁能保证这两段互斥执行。
+        cancellation_persist_error: Optional[Exception] = None
         with cls._ensemble_lock(ensemble_id):
             latest_record = cls.get_ensemble_record(ensemble_id) or record
             if not latest_record.cancelled:
@@ -534,11 +574,17 @@ class EnsembleRunner:
                         cls._ensemble_path(ensemble_id), latest_record.to_dict()
                     )
                     record = latest_record
-                except Exception:
+                except Exception as error:
+                    # 如果这次写入失败，启动循环完全可能永远不会看到取消
+                    # 信号，继续把剩余成员启动起来——这种情况下不能像成功
+                    # 停止时一样静默返回，否则调用方会误以为整个集成真的
+                    # 已经停止了。仍然尽力去停止已经存在的成员（下面的循环
+                    # 照常执行），但最终会让这次调用失败，而不是谎报成功。
                     logger.exception(
-                        f"写入集成取消信号失败（仍会继续尝试停止已存在的成员）: "
-                        f"ensemble_id={ensemble_id}"
+                        f"写入集成取消信号失败（仍会继续尝试停止已存在的成员，"
+                        f"但本次调用最终会失败）: ensemble_id={ensemble_id}"
                     )
+                    cancellation_persist_error = error
             else:
                 record = latest_record
 
@@ -557,6 +603,17 @@ class EnsembleRunner:
                     f"停止集成成员失败: ensemble_id={ensemble_id}, member_id={member.simulation_id}"
                 )
                 results[member.simulation_id] = {"success": False, "error": str(error)}
+
+        if cancellation_persist_error is not None:
+            # 已经尽力停止了所有当时已存在 run_state 的成员（上面的
+            # results），但取消信号本身没能落盘，意味着启动循环仍可能在
+            # 这次调用返回之后继续启动剩余成员。宁可让这次 stop_ensemble
+            # 调用报失败（API 层会转成 500），也不要谎报"已停止"。
+            raise RuntimeError(
+                f"未能持久化集成取消信号，无法保证启动循环会停止启动剩余"
+                f"成员: ensemble_id={ensemble_id}"
+            ) from cancellation_persist_error
+
         return results
 
     # ────────────────────────── 聚合 ──────────────────────────
@@ -574,6 +631,7 @@ class EnsembleRunner:
         if record is None:
             raise ValueError(f"集成不存在: {ensemble_id}")
 
+        manager = SimulationManager()
         member_infos = []
         completed_member_ids = []
         non_terminal_count = 0
@@ -628,6 +686,11 @@ class EnsembleRunner:
                         non_terminal_count += 1
                 else:
                     status = run_state.runner_status.value
+                    twitter_count, reddit_count = cls._member_action_counts(
+                        record.platform,
+                        manager._get_simulation_dir(member.simulation_id),
+                        run_state,
+                    )
                     info = {
                         "simulation_id": member.simulation_id,
                         "index": member.index,
@@ -635,11 +698,9 @@ class EnsembleRunner:
                         "error": run_state.error,
                         "current_round": run_state.current_round,
                         "total_rounds": run_state.total_rounds,
-                        "twitter_actions_count": run_state.twitter_actions_count,
-                        "reddit_actions_count": run_state.reddit_actions_count,
-                        "total_actions_count": (
-                            run_state.twitter_actions_count + run_state.reddit_actions_count
-                        ),
+                        "twitter_actions_count": twitter_count,
+                        "reddit_actions_count": reddit_count,
+                        "total_actions_count": twitter_count + reddit_count,
                     }
                     if status == RunnerStatus.COMPLETED.value:
                         completed_count += 1
@@ -792,6 +853,24 @@ class EnsembleRunner:
             except Exception:
                 logger.exception(f"读取动作日志失败（聚合统计）: {log_path}")
         return seen_this_run
+
+    @classmethod
+    def _member_action_counts(
+        cls, platform: str, member_dir: str, run_state: Any
+    ) -> Tuple[int, int]:
+        """
+        返回某个成员的 (twitter_action_count, reddit_action_count)。
+
+        parallel 成员直接信任 run_state 的计数器（并行脚本会同步维护它们）；
+        单平台成员的 run_state 计数器恒为 0（见模块文档第5条），改为现场
+        查 trace 表——用在 get_ensemble_summary 的逐成员展示上，确保同一份
+        响应里"这个成员的动作数"和聚合里"这些已完成成员的动作数"用的是
+        同一套口径，不会一个显示 0、另一个显示真实计数那种自相矛盾。
+        """
+        if platform == "parallel":
+            return run_state.twitter_actions_count, run_state.reddit_actions_count
+        count, _seen = cls._tally_action_types_from_trace_db(member_dir, platform, {})
+        return (count, 0) if platform == "twitter" else (0, count)
 
     @staticmethod
     def _tally_action_types_from_trace_db(

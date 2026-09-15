@@ -61,6 +61,16 @@ def start_ensemble():
     """
     try:
         data = request.get_json(silent=True) or {}
+        if not isinstance(data, dict):
+            # get_json(silent=True) happily returns a decoded non-object
+            # JSON value (a list, a string, a bare number/bool) without
+            # raising -- the "or {}" idiom above only rescues None/falsy,
+            # not e.g. `[1]`, so a plain `.get(...)` on it would otherwise
+            # raise AttributeError and surface as a 500.
+            return jsonify({
+                "success": False,
+                "error": "request body must be a JSON object",
+            }), 400
 
         source_simulation_id = data.get('source_simulation_id')
         if not source_simulation_id:
@@ -85,14 +95,16 @@ def start_ensemble():
 
         max_rounds = data.get('max_rounds')
         if max_rounds is not None:
-            try:
-                max_rounds = int(max_rounds)
-                if max_rounds <= 0:
-                    return jsonify({
-                        "success": False,
-                        "error": "max_rounds must be a positive integer",
-                    }), 400
-            except (ValueError, TypeError):
+            # isinstance(True, int) is True in Python, and int(2.9) silently
+            # truncates to 2 instead of rejecting a non-integer value --
+            # both would otherwise let a fractional or boolean max_rounds
+            # through and run a different number of rounds than requested.
+            if not isinstance(max_rounds, int) or isinstance(max_rounds, bool):
+                return jsonify({
+                    "success": False,
+                    "error": "max_rounds must be a positive integer",
+                }), 400
+            if max_rounds <= 0:
                 return jsonify({
                     "success": False,
                     "error": "max_rounds must be a positive integer",
@@ -190,6 +202,11 @@ def stop_ensemble():
     """停止集成中所有仍处于非终态的成员（尽力而为，逐成员报告结果）。"""
     try:
         data = request.get_json(silent=True) or {}
+        if not isinstance(data, dict):
+            return jsonify({
+                "success": False,
+                "error": "request body must be a JSON object",
+            }), 400
         ensemble_id = data.get('ensemble_id')
         if not ensemble_id:
             return jsonify({

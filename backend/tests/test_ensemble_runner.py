@@ -392,6 +392,90 @@ class TestEnsembleRecordPersistedBeforeMembersLaunch:
         assert reloaded is not None
         assert len(reloaded.members) == 2
 
+    def test_last_iterations_write_failure_is_repaired_after_the_loop(self, monkeypatch):
+        # Unlike the earlier-iteration case above (superseded by a later
+        # write), a failure on the *last* member's snapshot write has no
+        # subsequent loop iteration to fix it -- without a post-loop repair
+        # pass, that member would stay stuck showing start_error=None with
+        # no run_state, and get_ensemble_summary would classify it as
+        # "starting" forever even though start_ensemble already returned.
+        _make_source_simulation()
+
+        real_write = ensemble_runner_module.atomic_write_json
+        write_count = {"n": 0}
+
+        def fail_last_write(path, data):
+            write_count["n"] += 1
+            # writes: 1=provisional, 2=member0 snapshot, 3=member1 snapshot (last)
+            if write_count["n"] == 3:
+                raise OSError("simulated disk failure on the last member's write")
+            real_write(path, data)
+
+        monkeypatch.setattr(ensemble_runner_module, "atomic_write_json", fail_last_write)
+
+        record = EnsembleRunner.start_ensemble("sim_source12345", run_count=2)
+
+        # The repair pass (outside the failing monkeypatch window, since it
+        # only fails call #3) should have fixed member 1 up on disk.
+        assert record.members[1].start_error is None
+        reloaded = EnsembleRunner.get_ensemble_record(record.ensemble_id)
+        assert reloaded.members[1].start_error is None
+
+        summary = EnsembleRunner.get_ensemble_summary(record.ensemble_id)
+        assert summary["member_counts"]["running"] == 2
+
+
+class TestStopEnsembleCancellationPersistFailure:
+    def test_stop_raises_when_cancellation_flag_cannot_be_persisted(self, monkeypatch):
+        # If the cancellation flag can't be written to disk, the launch
+        # loop (if one is still in flight) will never see it and may keep
+        # launching members -- returning "success" here would be a lie.
+        _make_source_simulation()
+        record = EnsembleRunner.start_ensemble("sim_source12345", run_count=2)
+
+        def failing_write(path, data):
+            raise OSError("simulated disk failure")
+
+        monkeypatch.setattr(ensemble_runner_module, "atomic_write_json", failing_write)
+
+        with pytest.raises(RuntimeError):
+            EnsembleRunner.stop_ensemble(record.ensemble_id)
+
+    def test_stop_still_stops_existing_members_even_if_flag_persist_fails(self, monkeypatch):
+        # The best-effort stop of already-running members should still
+        # happen even though the call ultimately raises.
+        _make_source_simulation()
+        record = EnsembleRunner.start_ensemble("sim_source12345", run_count=2)
+        member_ids = [m.simulation_id for m in record.members]
+
+        def fake_stop_simulation(cls, simulation_id):
+            state = SimulationRunner.get_run_state(simulation_id)
+            state.runner_status = RunnerStatus.STOPPED
+            SimulationRunner._save_run_state(state)
+            return state
+
+        monkeypatch.setattr(
+            SimulationRunner, "stop_simulation", classmethod(fake_stop_simulation)
+        )
+
+        real_write = ensemble_runner_module.atomic_write_json
+
+        def fail_only_cancellation_write(path, data):
+            if data.get("cancelled") is True:
+                raise OSError("simulated disk failure")
+            real_write(path, data)
+
+        monkeypatch.setattr(
+            ensemble_runner_module, "atomic_write_json", fail_only_cancellation_write
+        )
+
+        with pytest.raises(RuntimeError):
+            EnsembleRunner.stop_ensemble(record.ensemble_id)
+
+        for member_id in member_ids:
+            run_state = SimulationRunner.get_run_state(member_id)
+            assert run_state.runner_status == RunnerStatus.STOPPED
+
 
 def _complete_member(member_id, twitter_actions=0, reddit_actions=0, rounds_reached=0):
     state = SimulationRunner.get_run_state(member_id)
@@ -572,6 +656,16 @@ class TestSinglePlatformAggregationReadsTraceDb:
         ])
 
         summary = EnsembleRunner.get_ensemble_summary(record.ensemble_id)
+
+        # The per-member info in the same response must agree with the
+        # aggregate -- not show twitter/reddit_actions_count=0 (straight
+        # from run_state) right next to an aggregate computed from the
+        # trace db, which would make the response internally contradictory.
+        member_infos_by_id = {m["simulation_id"]: m for m in summary["members"]}
+        assert member_infos_by_id[member_ids[0]]["reddit_actions_count"] == 2
+        assert member_infos_by_id[member_ids[1]]["reddit_actions_count"] == 3
+        assert member_infos_by_id[member_ids[0]]["twitter_actions_count"] == 0
+
         aggregate = summary["aggregate"]
         assert aggregate["completed_run_count"] == 2
 
