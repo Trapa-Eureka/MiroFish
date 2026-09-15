@@ -7,6 +7,7 @@ _monitor_simulation 在轮次前进时写入检查点、并在失败终态记录
 """
 
 import json
+import os
 
 import pytest
 
@@ -578,4 +579,72 @@ class TestStartSimulationClearsStaleActionLogs:
             SimulationRunner._action_queues.pop(simulation_id, None)
             SimulationRunner._stdout_files.pop(simulation_id, None)
             SimulationRunner._stderr_files.pop(simulation_id, None)
+            SimulationRunner._graph_memory_enabled.pop(simulation_id, None)
+
+    def test_start_fails_closed_if_stale_log_cannot_be_removed(self, tmp_path, monkeypatch):
+        """
+        Regression test for Codex's round-6 finding: if os.remove() itself
+        fails while clearing a stale action log (e.g. a read-only
+        filesystem), start_simulation must not silently continue and launch
+        a monitor that would replay the un-deletable stale log as fresh
+        progress. It must fail closed with a FAILED status and a matching
+        terminal checkpoint, and never reach subprocess/monitor launch.
+        """
+        simulation_id = "sim_lockedlogs12"
+        sim_dir = tmp_path / "runs" / simulation_id
+        scripts_dir = tmp_path / "scripts"
+        sim_dir.mkdir(parents=True)
+        scripts_dir.mkdir()
+        (sim_dir / "simulation_config.json").write_text(
+            json.dumps({
+                "time_config": {"total_simulation_hours": 1, "minutes_per_round": 60},
+            }),
+            encoding="utf-8",
+        )
+        (scripts_dir / "run_twitter_simulation.py").write_text("pass\n", encoding="utf-8")
+
+        stale_log = sim_dir / "twitter" / "actions.jsonl"
+        stale_log.parent.mkdir(parents=True)
+        stale_log.write_text(
+            json.dumps({"event_type": "round_end", "round": 99, "simulated_hours": 99}) + "\n",
+            encoding="utf-8",
+        )
+
+        monkeypatch.setattr(SimulationRunner, "RUN_STATE_DIR", str(tmp_path / "runs"))
+        monkeypatch.setattr(SimulationRunner, "SCRIPTS_DIR", str(scripts_dir))
+        monkeypatch.setattr(
+            SimulationRunner, "_sync_simulation_status", classmethod(lambda *a, **k: None)
+        )
+
+        popen_called = []
+        monkeypatch.setattr(
+            runner_module.subprocess,
+            "Popen",
+            lambda *a, **k: popen_called.append(1) or pytest.fail("must not spawn a process"),
+        )
+
+        real_remove = os.remove
+
+        def failing_remove(path):
+            if path == str(stale_log):
+                raise PermissionError("simulated read-only filesystem")
+            return real_remove(path)
+
+        monkeypatch.setattr(runner_module.os, "remove", failing_remove)
+
+        try:
+            with pytest.raises(RuntimeError, match="清理上一轮动作日志失败"):
+                SimulationRunner.start_simulation(
+                    simulation_id, platform="twitter", enable_graph_memory_update=False
+                )
+
+            assert popen_called == []
+            state = SimulationRunner._run_states[simulation_id]
+            assert state.runner_status == RunnerStatus.FAILED
+
+            checkpoint = load_checkpoint(str(sim_dir))
+            assert checkpoint is not None
+            assert checkpoint["runner_status"] == "failed"
+        finally:
+            SimulationRunner._run_states.pop(simulation_id, None)
             SimulationRunner._graph_memory_enabled.pop(simulation_id, None)

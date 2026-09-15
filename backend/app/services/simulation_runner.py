@@ -550,16 +550,34 @@ class SimulationRunner:
             # 清理；检查点让这个问题变得更容易被观察到，因此这里一并修复，
             # 让 SimulationRunner 自身保证每次新认领的运行不会读到旧日志，
             # 而不是依赖调用方是否传了 force）。
+            #
+            # 如果删除失败（例如目录只读），绝不能静默地继续启动——监控线程
+            # 一样会把这份旧日志当成新一轮的进度读进来。宁可让本次启动失败，
+            # 也不要放行一个从一开始就会汇报错误进度的运行。
+            stale_log_error = None
             for _platform_dir in ("twitter", "reddit"):
                 _stale_log = os.path.join(sim_dir, _platform_dir, "actions.jsonl")
                 if os.path.exists(_stale_log):
                     try:
                         os.remove(_stale_log)
-                    except Exception:
+                    except Exception as _cleanup_error:
                         logger.exception(
                             f"清理上一轮动作日志失败: simulation_id={simulation_id}, "
                             f"file={_stale_log}"
                         )
+                        stale_log_error = _cleanup_error
+
+            if stale_log_error is not None:
+                state.runner_status = RunnerStatus.FAILED
+                state.error = f"清理上一轮动作日志失败，拒绝启动新一轮运行: {stale_log_error}"
+                cls._save_run_state(state)
+                cls._save_terminal_checkpoint(simulation_id, state)
+                cls._sync_simulation_status(
+                    simulation_id,
+                    RunnerStatus.FAILED,
+                    state.error,
+                )
+                raise RuntimeError(state.error) from stale_log_error
 
             # 这里是"新一轮运行已确定接管该 simulation_id"的唯一节点，
             # 覆盖了后续所有可能的启动失败路径（Zep 更新器创建失败、脚本
