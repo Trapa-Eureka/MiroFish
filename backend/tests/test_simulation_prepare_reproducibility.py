@@ -221,6 +221,33 @@ class TestPrepareSimulationReproducibility:
         )
         assert result.status == SimulationStatus.READY
 
+    def test_failed_reprepare_clears_stale_manifest(self, prepared_simulation, monkeypatch):
+        """
+        Regression test: re-preparing a simulation that already has a manifest
+        from a prior successful run must not leave that manifest in place if
+        the new attempt fails -- GET /manifest should not keep describing a
+        stale, no-longer-accurate run.
+        """
+        manager, result, sim_dir, project = prepared_simulation
+        assert load_manifest(sim_dir) is not None  # sanity: manifest exists from fixture
+
+        class _EmptyReader:
+            def filter_defined_entities(self, **kwargs):
+                return FilteredEntities(
+                    entities=[], entity_types=set(), total_count=0, filtered_count=0
+                )
+
+        monkeypatch.setattr(simulation_manager_module, "ZepEntityReader", _EmptyReader)
+
+        with pytest.raises(ValueError):
+            manager.prepare_simulation(
+                simulation_id=result.simulation_id,
+                simulation_requirement="test requirement",
+                document_text="some source document text",
+            )
+
+        assert load_manifest(sim_dir) is None
+
 
 class TestManifestApiEndpoint:
     def test_get_manifest_returns_persisted_manifest(self, prepared_simulation):

@@ -352,9 +352,19 @@ class SimulationManager:
             state.config_generated = False
             state.config_reasoning = ""
             self._save_simulation_state(state)
-            
+
             sim_dir = self._get_simulation_dir(simulation_id)
-            
+
+            # 清除上一次准备遗留的可复现性清单。如果这次准备中途失败，
+            # 不应该让 GET /manifest 继续返回一份描述"上一次成功准备"的
+            # 旧清单，让调用方误以为它描述的是当前（可能已失败/不一致）的状态。
+            try:
+                old_manifest_path = reproducibility_manifest.manifest_path(sim_dir)
+                if os.path.exists(old_manifest_path):
+                    os.remove(old_manifest_path)
+            except Exception:
+                logger.exception(f"清除旧的可复现性清单失败: simulation_id={simulation_id}")
+
             # ========== 阶段1: 读取并过滤实体 ==========
             if progress_callback:
                 progress_callback("reading", 0, t('progress.connectingZepGraph'))
