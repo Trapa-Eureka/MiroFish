@@ -203,6 +203,42 @@ class TestCreateBacktestValidation:
                 source_simulation_id="sim_source12345",
             )
 
+    def test_whitespace_only_scenario_description_rejected(self):
+        _make_completed_simulation()
+        with pytest.raises(ValueError, match="scenario_description"):
+            BacktestRunner.create_backtest(
+                scenario_description="   \t\n  ", t0_cutoff="2024-01-01",
+                prediction={"occurred": True},
+                source_simulation_id="sim_source12345",
+            )
+
+    def test_whitespace_only_t0_cutoff_rejected(self):
+        _make_completed_simulation()
+        with pytest.raises(ValueError, match="t0_cutoff"):
+            BacktestRunner.create_backtest(
+                scenario_description="x", t0_cutoff="   ",
+                prediction={"occurred": True},
+                source_simulation_id="sim_source12345",
+            )
+
+    def test_whitespace_only_direction_rejected(self):
+        _make_completed_simulation()
+        with pytest.raises(ValueError, match="direction"):
+            BacktestRunner.create_backtest(
+                scenario_description="x", t0_cutoff="2024-01-01",
+                prediction={"direction": "   "},
+                source_simulation_id="sim_source12345",
+            )
+
+    def test_whitespace_only_sentiment_rejected(self):
+        _make_completed_simulation()
+        with pytest.raises(ValueError, match="sentiment"):
+            BacktestRunner.create_backtest(
+                scenario_description="x", t0_cutoff="2024-01-01",
+                prediction={"sentiment": ""},
+                source_simulation_id="sim_source12345",
+            )
+
     def test_missing_source_simulation_rejected(self):
         with pytest.raises(ValueError, match="不存在"):
             BacktestRunner.create_backtest(
@@ -826,6 +862,19 @@ class TestScoringMetrics:
     def test_direction_correct_is_case_and_whitespace_insensitive(self):
         result = self._score({"direction": " Up "}, {"direction": "up"})
         assert result.metrics["direction_correct"] is True
+
+    def test_blank_ground_truth_direction_rejected_not_falsely_matched(self):
+        # Regression test: a blank/whitespace-only direction must be
+        # rejected outright, not normalized to "" and falsely matched
+        # against another blank value (which would report a successful
+        # direction_correct=True and inflate suite accuracy).
+        _make_completed_simulation()
+        case = BacktestRunner.create_backtest(
+            scenario_description="x", t0_cutoff="2024-01-01",
+            prediction={"direction": "up"}, source_simulation_id="sim_source12345",
+        )
+        with pytest.raises(ValueError, match="direction"):
+            BacktestRunner.record_ground_truth(case.backtest_id, {"direction": "  "})
 
     def test_sentiment_incorrect_when_mismatched(self):
         result = self._score({"sentiment": "positive"}, {"sentiment": "negative"})

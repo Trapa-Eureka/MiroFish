@@ -388,9 +388,9 @@ class BacktestRunner:
             raise ValueError(
                 "必须且只能提供 source_simulation_id 或 source_ensemble_id 中的一个"
             )
-        if not scenario_description or not isinstance(scenario_description, str):
+        if not isinstance(scenario_description, str) or not scenario_description.strip():
             raise ValueError("scenario_description 不能为空")
-        if not t0_cutoff or not isinstance(t0_cutoff, str):
+        if not isinstance(t0_cutoff, str) or not t0_cutoff.strip():
             raise ValueError("t0_cutoff 不能为空")
 
         parsed_prediction = cls._parse_prediction(prediction)
@@ -675,10 +675,16 @@ class BacktestRunner:
     def _validate_scalar_fields(occurred, direction, sentiment) -> None:
         if occurred is not None and not isinstance(occurred, bool):
             raise ValueError("occurred 必须是布尔值")
-        if direction is not None and not isinstance(direction, str):
-            raise ValueError("direction 必须是字符串")
-        if sentiment is not None and not isinstance(sentiment, str):
-            raise ValueError("sentiment 必须是字符串")
+        if direction is not None:
+            if not isinstance(direction, str):
+                raise ValueError("direction 必须是字符串")
+            if not direction.strip():
+                raise ValueError("direction 不能是空字符串")
+        if sentiment is not None:
+            if not isinstance(sentiment, str):
+                raise ValueError("sentiment 必须是字符串")
+            if not sentiment.strip():
+                raise ValueError("sentiment 不能是空字符串")
 
     @staticmethod
     def _validate_distribution(distribution: Any) -> None:
