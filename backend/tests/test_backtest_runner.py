@@ -286,6 +286,50 @@ class TestCreateBacktestValidation:
                 source_simulation_id="sim_source12345",
             )
 
+    def test_oversized_integer_rank_rejected_not_500(self):
+        # math.isfinite() raises OverflowError (not returns False) when
+        # converting an arbitrary-precision Python int this large to a
+        # float; a naive isfinite check would let this propagate as an
+        # unhandled 500 instead of a clean validation error.
+        _make_completed_simulation()
+        with pytest.raises(ValueError, match="rank"):
+            BacktestRunner.create_backtest(
+                scenario_description="x", t0_cutoff="2024-01-01",
+                prediction={"rank": 10 ** 400},
+                source_simulation_id="sim_source12345",
+            )
+
+    def test_oversized_integer_probability_rejected_not_500(self):
+        _make_completed_simulation()
+        with pytest.raises(ValueError, match="probability"):
+            BacktestRunner.create_backtest(
+                scenario_description="x", t0_cutoff="2024-01-01",
+                prediction={"probability": 10 ** 400},
+                source_simulation_id="sim_source12345",
+            )
+
+    def test_oversized_integer_distribution_value_rejected_not_500(self):
+        _make_completed_simulation()
+        with pytest.raises(ValueError, match="distribution"):
+            BacktestRunner.create_backtest(
+                scenario_description="x", t0_cutoff="2024-01-01",
+                prediction={"distribution": {"a": 10 ** 400, "b": 1.0}},
+                source_simulation_id="sim_source12345",
+            )
+
+    def test_distribution_with_overflowing_sum_rejected(self):
+        # Each value is individually finite, but 1e308 + 1e308 overflows to
+        # inf when summed -- a naive `total <= 0` check wouldn't catch this
+        # (inf <= 0 is False), and normalizing against an infinite total
+        # would silently produce a degenerate all-zero distribution.
+        _make_completed_simulation()
+        with pytest.raises(ValueError, match="distribution"):
+            BacktestRunner.create_backtest(
+                scenario_description="x", t0_cutoff="2024-01-01",
+                prediction={"distribution": {"a": 1e308, "b": 1e308}},
+                source_simulation_id="sim_source12345",
+            )
+
 
 class TestCreateBacktestHappyPath:
     def test_creates_backtest_from_completed_simulation(self):

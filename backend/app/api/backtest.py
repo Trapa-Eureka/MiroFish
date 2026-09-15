@@ -19,7 +19,7 @@ from ..utils.authorization import (
     is_owned_by_current_user,
     ForbiddenError,
 )
-from ..utils.id_validation import InvalidIdentifierError
+from ..utils.id_validation import InvalidIdentifierError, PathContainmentError
 from ..utils.logger import get_logger
 
 logger = get_logger('mirofish.api.backtest')
@@ -107,19 +107,22 @@ def create_backtest():
             "data": case.to_dict(),
         })
 
+    except ForbiddenError:
+        raise
+
+    except (InvalidIdentifierError, PathContainmentError):
+        # InvalidIdentifierError/PathContainmentError 都是 ValueError 的
+        # 子类，必须排在下面的 except ValueError 之前——否则会先被那个
+        # 更宽泛的分支捕获，永远走不到这里，交给全局处理器返回统一、
+        # 经过消毒的 400（PathContainmentError 的全局处理器专门避免把
+        # 原始文件系统路径回显给客户端）。
+        raise
+
     except ValueError as e:
         return jsonify({
             "success": False,
             "error": str(e),
         }), 400
-
-    except ForbiddenError:
-        raise
-
-    except InvalidIdentifierError:
-        # 交给全局 InvalidIdentifierError 处理器返回 400，而不是被下面的
-        # 通用 Exception 分支吞成一个带 traceback 的 500。
-        raise
 
     except Exception as e:
         logger.error(f"登记回测失败: {str(e)}")
@@ -171,18 +174,18 @@ def record_ground_truth(backtest_id: str):
             "data": case.to_dict(),
         })
 
+    except ForbiddenError:
+        raise
+
+    except (InvalidIdentifierError, PathContainmentError):
+        raise
+
     except ValueError as e:
         status_code = 404 if "不存在" in str(e) else 400
         return jsonify({
             "success": False,
             "error": str(e),
         }), status_code
-
-    except ForbiddenError:
-        raise
-
-    except InvalidIdentifierError:
-        raise
 
     except Exception as e:
         logger.error(f"登记回测真实结果失败: {str(e)}")
@@ -209,7 +212,7 @@ def get_backtest(backtest_id: str):
         })
     except ForbiddenError:
         raise
-    except InvalidIdentifierError:
+    except (InvalidIdentifierError, PathContainmentError):
         raise
     except Exception as e:
         logger.error(f"获取回测失败: {str(e)}")

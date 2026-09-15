@@ -81,6 +81,22 @@ class TestCreateBacktestRoute:
         response = client.post("/api/backtest/create", json=[1, 2, 3])
         assert response.status_code == 400
 
+    def test_malformed_source_simulation_id_returns_400_not_500(self, client):
+        # InvalidIdentifierError is a ValueError subclass; it must be
+        # re-raised before the generic except-ValueError clause catches it,
+        # so it reaches the app's global 400 handler instead of the
+        # route's own (still-400, but differently worded) ValueError path.
+        response = client.post(
+            "/api/backtest/create",
+            json={
+                "source_simulation_id": "bad$id",
+                "scenario_description": "x",
+                "t0_cutoff": "2024-01-01",
+                "prediction": {"occurred": True},
+            },
+        )
+        assert response.status_code == 400
+
     def test_404s_cleanly_when_source_missing(self, client):
         response = client.post(
             "/api/backtest/create",
@@ -139,6 +155,13 @@ class TestRecordGroundTruthRoute:
             json={"ground_truth": {"occurred": True}},
         )
         assert response.status_code == 404
+
+    def test_malformed_backtest_id_returns_400_not_500(self, client):
+        response = client.post(
+            "/api/backtest/bad$id/ground-truth",
+            json={"ground_truth": {"occurred": True}},
+        )
+        assert response.status_code == 400
 
     def test_happy_path_computes_metrics(self, client):
         backtest_id = self._create_case(client, {"occurred": True, "probability": 0.9})

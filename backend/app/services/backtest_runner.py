@@ -185,10 +185,30 @@ def _normalize_label(value: Optional[str]) -> Optional[str]:
     return value.strip().lower()
 
 
+def _is_finite_number(value: Any) -> bool:
+    """
+    math.isfinite() 对超大 Python int（比如一个 ~309 位的整数）会在内部转换
+    成 float 时抛 OverflowError，而不是像对 float 输入那样干净地返回
+    False——所有校验路径都统一走这个包装，把"转换失败"也当作"不是一个
+    有限数字"来拒绝，而不是让 500 泄漏出去。
+    """
+    try:
+        return math.isfinite(value)
+    except (OverflowError, TypeError):
+        return False
+
+
 def _normalize_distribution(distribution: Dict[str, float]) -> Dict[str, float]:
     total = sum(distribution.values())
-    if total <= 0:
-        raise ValueError("distribution values must be non-negative numbers summing to > 0")
+    # 即使每个值单独都是有限数字，加起来仍然可能溢出成 inf（例如两个
+    # 1e308 相加）；不检查的话，除出来的"归一化"分布会退化成一堆 0，
+    # 让后续的分布距离计算给出一个看似合理但完全错误的数字，而不是
+    # 报错。
+    if not _is_finite_number(total) or total <= 0:
+        raise ValueError(
+            "distribution values must be non-negative finite numbers summing to "
+            "a positive finite total"
+        )
     return {label: value / total for label, value in distribution.items()}
 
 
@@ -484,14 +504,14 @@ class BacktestRunner:
         if prediction.probability is not None:
             if not isinstance(prediction.probability, (int, float)) or isinstance(
                 prediction.probability, bool
-            ) or not math.isfinite(prediction.probability):
+            ) or not _is_finite_number(prediction.probability):
                 raise ValueError("prediction.probability 必须是数字")
             if not (0.0 <= prediction.probability <= 1.0):
                 raise ValueError("prediction.probability 必须在 0 到 1 之间")
         if prediction.rank is not None and (
             not isinstance(prediction.rank, (int, float))
             or isinstance(prediction.rank, bool)
-            or not math.isfinite(prediction.rank)
+            or not _is_finite_number(prediction.rank)
         ):
             raise ValueError("prediction.rank 必须是有限数字")
         if prediction.distribution is not None:
@@ -511,7 +531,7 @@ class BacktestRunner:
         if ground_truth.rank is not None and (
             not isinstance(ground_truth.rank, (int, float))
             or isinstance(ground_truth.rank, bool)
-            or not math.isfinite(ground_truth.rank)
+            or not _is_finite_number(ground_truth.rank)
         ):
             raise ValueError("ground_truth.rank 必须是有限数字")
         if ground_truth.distribution is not None:
@@ -539,12 +559,16 @@ class BacktestRunner:
             if (
                 not isinstance(value, (int, float))
                 or isinstance(value, bool)
-                or not math.isfinite(value)
+                or not _is_finite_number(value)
                 or value < 0
             ):
                 raise ValueError("distribution 的值必须是非负的有限数字")
-        if sum(distribution.values()) <= 0:
-            raise ValueError("distribution 的值之和必须大于 0")
+        # 每个值单独有限，加起来仍然可能溢出成 inf（例如两个 1e308 相加）；
+        # 不检查的话，_normalize_distribution 会在真正打分时才发现总和不是
+        # 有限数字。这里在入库前就拒绝，报错更及时。
+        total = sum(distribution.values())
+        if not _is_finite_number(total) or total <= 0:
+            raise ValueError("distribution 的值之和必须是大于 0 的有限数字")
 
     @staticmethod
     def _has_any_field(obj) -> bool:
