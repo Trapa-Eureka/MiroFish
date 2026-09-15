@@ -579,6 +579,83 @@ class TestCreateBacktestHappyPath:
         assert "ens_source1234_m0" in case.source_run_snapshot_at
         assert "ens_source1234_m1" not in case.source_run_snapshot_at
 
+    def test_genuinely_incomplete_ensemble_rejected(self):
+        _make_completed_ensemble(
+            member_count=2,
+            member_statuses=[RunnerStatus.COMPLETED, RunnerStatus.RUNNING],
+        )
+        with pytest.raises(ValueError, match="尚未成功完成"):
+            BacktestRunner.create_backtest(
+                scenario_description="x", t0_cutoff="2024-01-01",
+                prediction={"occurred": True},
+                source_ensemble_id="ens_source1234",
+            )
+
+    def test_ensemble_still_creatable_when_this_workers_cache_is_stale_running(self):
+        # Regression test for the flawed "cheap early exit": a cache-based
+        # pre-check must not reject an ensemble just because *this*
+        # process happened to cache an earlier RUNNING snapshot for a
+        # member that has genuinely completed since (e.g. on another
+        # worker). Eligibility must be decided solely by the
+        # force_reload=True loop.
+        _make_completed_ensemble(member_count=2)
+        # Prime this process's cache with a stale RUNNING entry for
+        # member 0 (simulating this worker having observed it earlier,
+        # before it finished), while the on-disk state is already the
+        # real COMPLETED written by _make_completed_ensemble above.
+        from app.services.simulation_runner import SimulationRunState as _SRS
+
+        SimulationRunner._run_states["ens_source1234_m0"] = _SRS(
+            simulation_id="ens_source1234_m0", runner_status=RunnerStatus.RUNNING
+        )
+
+        case = BacktestRunner.create_backtest(
+            scenario_description="x", t0_cutoff="2024-01-01",
+            prediction={"occurred": True},
+            source_ensemble_id="ens_source1234",
+        )
+        assert "ens_source1234_m0" in case.source_run_snapshot_at
+        assert "ens_source1234_m1" in case.source_run_snapshot_at
+
+    def test_cancelled_after_crash_provisional_member_does_not_block_creation(self):
+        # Regression test matching TASK 8's crash-then-cancel scenario
+        # (see EnsembleRunner.get_ensemble_summary): a member the launch
+        # loop never reached before the whole worker crashed has no
+        # start_error and no run_state, but a subsequent stop_ensemble
+        # call durably marked the ensemble record cancelled=True.
+        # get_ensemble_summary() classifies that placeholder as a
+        # terminal failure (not "unknown"), and this code must agree
+        # instead of treating the missing run_state as an anomaly to
+        # reject outright.
+        record = _make_completed_ensemble(member_count=1)
+        never_started = EnsembleMemberRecord(
+            simulation_id="ens_source1234_m1", index=1
+        )
+        cancelled_record = EnsembleRecord(
+            ensemble_id=record.ensemble_id,
+            source_simulation_id=record.source_simulation_id,
+            project_id=record.project_id,
+            graph_id=record.graph_id,
+            platform=record.platform,
+            max_rounds=record.max_rounds,
+            run_count=2,
+            members=list(record.members) + [never_started],
+            created_at=record.created_at,
+            owner_id=record.owner_id,
+            cancelled=True,
+        )
+        atomic_write_json(
+            EnsembleRunner._ensemble_path(record.ensemble_id), cancelled_record.to_dict()
+        )
+
+        case = BacktestRunner.create_backtest(
+            scenario_description="x", t0_cutoff="2024-01-01",
+            prediction={"occurred": True},
+            source_ensemble_id=record.ensemble_id,
+        )
+        assert "ens_source1234_m0" in case.source_run_snapshot_at
+        assert "ens_source1234_m1" not in case.source_run_snapshot_at
+
 
 class TestRecordGroundTruth:
     def _create_case(self, prediction):

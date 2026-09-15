@@ -418,32 +418,36 @@ class BacktestRunner:
             record = EnsembleRunner.get_ensemble_record(source_ensemble_id)
             if record is None:
                 raise ValueError(f"来源集成不存在: {source_ensemble_id}")
-            # 这里只用 get_ensemble_summary()（它对每个成员走的是
-            # get_run_state 的默认缓存路径）做一次廉价的提前退出——如果
-            # 连这个可能过期的视角都认为"没完成"，就没必要再往下做一遍
-            # 更贵的、绕开缓存的复核了。真正决定"能不能被这份回测锁定"的
-            # 是下面对每个成员 force_reload 之后的复核，而不是这次判断。
-            summary = EnsembleRunner.get_ensemble_summary(source_ensemble_id)
-            if summary["status"] != "completed":
-                raise ValueError(
-                    f"来源集成尚未成功完成，无法作为回测预测依据: {source_ensemble_id}"
-                )
             project_id = record.project_id
-            # EnsembleRecord.created_at 本身不足以证明"这份聚合背后的每个
-            # 成员运行都还是当初那一次"——集成的每个成员本质上就是一次
-            # 普通的、可以被 /api/simulation/start 原地重启的模拟，
-            # ensemble_id/created_at 完全侦测不到某个成员被重跑过。这里
-            # 对每个成员用 force_reload=True 重新读一遍真实状态（跳过可能
-            # 过期的进程内缓存——上面 summary 用的缓存路径可能仍然认为某个
-            # 已经被重启、此刻正在 RUNNING 的成员是 COMPLETED），只对确实
-            # 仍处于 COMPLETED 的成员计入这份回测的"已完成成员"集合；任何
-            # 非 start_error 成员如果 force_reload 后不再是 COMPLETED
+            # 特意不先用 get_ensemble_summary() 的（默认缓存路径）状态做
+            # 提前退出：那样看似是个廉价优化，实际上会引入相反方向的假
+            # 阴性——如果这个进程恰好缓存了某个成员较早的 RUNNING 状态，
+            # 而它其实已经在另一个 worker 上真正跑完了，summary 会一直
+            # 报"running"，导致一个货真价实已完成的集成被永久拒绝，永远
+            # 走不到下面这段真正准确的复核。是否"能被这份回测锁定"完全
+            # 由下面这个循环（每个成员都 force_reload=True）说了算。
+            #
+            # EnsembleRecord.created_at 本身也不足以证明"这份聚合背后的
+            # 每个成员运行都还是当初那一次"——集成的每个成员本质上就是
+            # 一次普通的、可以被 /api/simulation/start 原地重启的模拟，
+            # ensemble_id/created_at 完全侦测不到某个成员被重跑过；所以
+            # 这里对每个成员单独 force_reload、只把确实仍处于 COMPLETED
+            # 的那些计入"已完成成员"集合，拼成 source_run_snapshot_at 的
+            # 复合指纹——任何成员如果 force_reload 后不再是 COMPLETED
             # （无论是仍在跑、还是被重启后又在跑），都不能被当作这份预测
-            # 的可信依据，必须整体拒绝，而不是悄悄把它排除在指纹之外——
-            # 否则集成的聚合结果和这份指纹描述的成员集合就对不上了。
-            # FAILED/STOPPED 的成员则正常跳过：它们本来就不参与
-            # EnsembleRunner 的聚合统计（见 TASK 8 的 _compute_aggregate），
-            # 状态变化与这份预测的可信度无关。
+            # 的可信依据，必须整体拒绝，而不是悄悄把它排除在指纹之外。
+            #
+            # 三类成员会被正常跳过、不参与判定：
+            # - member.start_error is not None：启动阶段就失败了。
+            # - FAILED/STOPPED：本来就不参与 EnsembleRunner 的聚合统计
+            #   （见 TASK 8 的 _compute_aggregate），状态变化与这份预测
+            #   的可信度无关。
+            # - record.cancelled 为真、且这个成员从未真正启动过（没有
+            #   start_error，也没有 run_state）：这是 TASK 8 里"启动循环
+            #   崩溃后被取消"的占位成员——get_ensemble_summary() 会把它
+            #   归类为已取消的终态失败，而不是"未知"；这里必须用同样的
+            #   逻辑对待它，否则一个 summary 认为完全可以打分的集成会在
+            #   这里被误判为"缺状态、需要拒绝"。
             member_snapshots = []
             for member in record.members:
                 if member.start_error is not None:
@@ -452,6 +456,8 @@ class BacktestRunner:
                     member.simulation_id, force_reload=True
                 )
                 if member_run_state is None:
+                    if record.cancelled:
+                        continue
                     raise ValueError(
                         f"来源集成尚未成功完成，无法作为回测预测依据: {source_ensemble_id}"
                     )
