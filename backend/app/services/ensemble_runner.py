@@ -54,6 +54,7 @@ import os
 import shutil
 import sqlite3
 import statistics
+import threading
 import uuid
 from dataclasses import asdict, dataclass, field
 from datetime import datetime
@@ -202,6 +203,21 @@ class EnsembleRunner:
         '../../uploads/ensembles'
     )
 
+    # 与 SimulationRunner._finalization_lock 同样的模式：每个 ensemble_id
+    # 一把锁，序列化"取消检查 + 启动下一个成员 + 落盘快照"（start_ensemble
+    # 循环的每一轮）与"设置取消信号"（stop_ensemble）之间的竞争。没有这把
+    # 锁，stop_ensemble 可能恰好在启动循环已经通过取消检查、但
+    # start_simulation 还没来得及发布 run_state 的窄窗口内运行——此时
+    # stop_ensemble 找不到该成员的 run_state，跳过它并返回成功，但启动
+    # 循环仍会继续把它启动起来。
+    _ensemble_locks: Dict[str, threading.Lock] = {}
+    _ensemble_locks_guard = threading.Lock()
+
+    @classmethod
+    def _ensemble_lock(cls, ensemble_id: str) -> threading.Lock:
+        with cls._ensemble_locks_guard:
+            return cls._ensemble_locks.setdefault(ensemble_id, threading.Lock())
+
     @classmethod
     def _get_ensemble_dir(cls, ensemble_id: str) -> str:
         validate_ensemble_id(ensemble_id)
@@ -346,116 +362,125 @@ class EnsembleRunner:
             member_id = f"{ensemble_id}_m{index}"
             start_error: Optional[str] = None
 
-            # 每次启动下一个成员之前都重新读盘检查取消信号：一次并发的
-            # stop_ensemble 调用可能已经把这个集成标记为已取消（它没法
-            # 直接停止一个还不存在 run_state 的成员，只能设置这个信号，
-            # 依赖这里的检查来阻止它被启动）。
-            current_on_disk = cls.get_ensemble_record(ensemble_id)
-            if current_on_disk is not None and current_on_disk.cancelled:
-                start_error = "集成已被取消，未尝试启动"
-            else:
+            # 取消检查 + 启动 + 落盘快照必须作为一个原子段对 stop_ensemble
+            # 加锁：如果只是"读一下取消标志"而不持锁，stop_ensemble 完全
+            # 可能恰好在这里检查通过之后、start_simulation 真正发布
+            # run_state 之前那个窄窗口内运行——那时 stop_ensemble 找不到
+            # 这个成员的 run_state，只能跳过它并返回成功，但下面的
+            # start_simulation 调用仍会照常把它启动起来。持有同一把
+            # ensemble 级别的锁（与 SimulationRunner._finalization_lock
+            # 同样的模式）能确保 stop_ensemble 的"设置取消信号"操作，要么
+            # 在某一轮成员启动开始之前完成（这一轮就会看到取消），要么
+            # 等到这一轮（包括落盘）结束之后才能拿到锁再执行。
+            with cls._ensemble_lock(ensemble_id):
+                # 每次启动下一个成员之前都重新读盘检查取消信号：一次并发的
+                # stop_ensemble 调用可能已经把这个集成标记为已取消（它没法
+                # 直接停止一个还不存在 run_state 的成员，只能设置这个信号，
+                # 依赖这里的检查来阻止它被启动）。
+                current_on_disk = cls.get_ensemble_record(ensemble_id)
+                if current_on_disk is not None and current_on_disk.cancelled:
+                    start_error = "集成已被取消，未尝试启动"
+                else:
+                    try:
+                        member_dir = manager._get_simulation_dir(member_id)
+                        for filename in files_to_copy:
+                            src_path = os.path.join(source_dir, filename)
+                            if not os.path.exists(src_path):
+                                # enable_reddit/enable_twitter 为 True 但对应文件缺失，
+                                # 说明来源模拟本身处于不一致状态——让这个成员启动
+                                # 失败并记录原因，而不是启动一个缺人设的模拟。
+                                raise FileNotFoundError(f"来源模拟缺少 {filename}")
+                            shutil.copyfile(src_path, os.path.join(member_dir, filename))
+
+                        member_state = SimulationState(
+                            simulation_id=member_id,
+                            project_id=source_state.project_id,
+                            graph_id=source_state.graph_id,
+                            enable_twitter=source_state.enable_twitter,
+                            enable_reddit=source_state.enable_reddit,
+                            status=SimulationStatus.READY,
+                            entities_count=source_state.entities_count,
+                            profiles_count=source_state.profiles_count,
+                            entity_types=list(source_state.entity_types),
+                            profiles_generated=True,
+                            config_generated=True,
+                            config_reasoning=source_state.config_reasoning,
+                            owner_id=source_state.owner_id,
+                            # 人设文件是原样拷贝的，不是重新生成的，所以沿用同一个
+                            # random_seed 是诚实的——它就是这份被拷贝的人设实际使用
+                            # 过的种子，而不是一个凭空分配、从未真正生效过的新种子。
+                            random_seed=source_state.random_seed,
+                        )
+                        manager._save_simulation_state(member_state)
+
+                        # graph_id=None：集成成员不写入 Zep 图谱记忆——N 个成员并发
+                        # 把各自的模拟活动写回同一个图谱会相互践踏且没有明确语义
+                        # （"图谱应该记住哪一次运行？"）。这是一个有意识的范围限制，
+                        # 而不是遗漏；需要图谱记忆更新的场景应该用单次模拟运行。
+                        SimulationRunner.start_simulation(
+                            simulation_id=member_id,
+                            platform=resolved_platform,
+                            max_rounds=max_rounds,
+                            enable_graph_memory_update=False,
+                            graph_id=None,
+                            # 集成成员没有人工操作者去调用 interview/close：不传
+                            # no_wait 的话，子进程会在跑完所有轮次后停留在等待
+                            # 命令的状态，SimulationRunner 永远看不到进程退出，
+                            # 这个成员也就永远不会变成 COMPLETED，集成也就永远
+                            # 凑不齐聚合所需的终态成员。
+                            no_wait=True,
+                        )
+                    except Exception as error:
+                        logger.exception(
+                            f"集成成员启动失败: ensemble_id={ensemble_id}, member_id={member_id}"
+                        )
+                        start_error = str(error)
+
+                members.append(EnsembleMemberRecord(
+                    simulation_id=member_id,
+                    index=index,
+                    start_error=start_error,
+                ))
+
+                # 每尝试完一个成员就重新落盘一次快照（已尝试过的成员带着真实
+                # start_error，尚未轮到的成员沿用临时占位记录）。这样即使 worker
+                # 在循环中途整个崩溃，暴露出的"启动结果未知"窗口也只是"崩溃那
+                # 一刻正在处理的那一个成员"，而不是循环结束前才写入的整批成员。
+                # 完全消除这个窗口需要一套心跳/存活检测机制来分辨"还没轮到"和
+                # "启动器已经死了、永远不会轮到"——这类机制目前在
+                # SimulationRunner 自身的单进程架构里也没有（见模块文档第3条
+                # 引用的 TASK 7 结论），本模块选择不新增这套机制，只把已尝试
+                # 部分的可见窗口缩到最小。写入本身是尽力而为的：failure 只记
+                # 日志，不影响已经启动（或已经失败）的成员——它们是真实、可能
+                # 已产生 LLM 调用成本的进程，不应该因为记录簿记失败被回滚。
                 try:
-                    member_dir = manager._get_simulation_dir(member_id)
-                    for filename in files_to_copy:
-                        src_path = os.path.join(source_dir, filename)
-                        if not os.path.exists(src_path):
-                            # enable_reddit/enable_twitter 为 True 但对应文件缺失，
-                            # 说明来源模拟本身处于不一致状态——让这个成员启动
-                            # 失败并记录原因，而不是启动一个缺人设的模拟。
-                            raise FileNotFoundError(f"来源模拟缺少 {filename}")
-                        shutil.copyfile(src_path, os.path.join(member_dir, filename))
-
-                    member_state = SimulationState(
-                        simulation_id=member_id,
-                        project_id=source_state.project_id,
-                        graph_id=source_state.graph_id,
-                        enable_twitter=source_state.enable_twitter,
-                        enable_reddit=source_state.enable_reddit,
-                        status=SimulationStatus.READY,
-                        entities_count=source_state.entities_count,
-                        profiles_count=source_state.profiles_count,
-                        entity_types=list(source_state.entity_types),
-                        profiles_generated=True,
-                        config_generated=True,
-                        config_reasoning=source_state.config_reasoning,
-                        owner_id=source_state.owner_id,
-                        # 人设文件是原样拷贝的，不是重新生成的，所以沿用同一个
-                        # random_seed 是诚实的——它就是这份被拷贝的人设实际使用
-                        # 过的种子，而不是一个凭空分配、从未真正生效过的新种子。
-                        random_seed=source_state.random_seed,
+                    # 这段仍然持有 ensemble 锁，所以这里读到的 cancelled 就是
+                    # 最新值——不会有另一个 stop_ensemble 在这次读和这次写
+                    # 之间插进来改写它；单独重新读一次只是避免直接复用循环
+                    # 开头缓存的 current_on_disk（那是本轮加锁之前读的）。
+                    latest_on_disk = cls.get_ensemble_record(ensemble_id)
+                    still_cancelled = bool(latest_on_disk and latest_on_disk.cancelled)
+                    atomic_write_json(
+                        cls._ensemble_path(ensemble_id),
+                        EnsembleRecord(
+                            ensemble_id=ensemble_id,
+                            source_simulation_id=source_simulation_id,
+                            project_id=source_state.project_id,
+                            graph_id=source_state.graph_id,
+                            platform=resolved_platform,
+                            max_rounds=max_rounds,
+                            run_count=run_count,
+                            members=members + provisional_members[index + 1:],
+                            created_at=provisional_record.created_at,
+                            owner_id=source_state.owner_id,
+                            cancelled=still_cancelled,
+                        ).to_dict(),
                     )
-                    manager._save_simulation_state(member_state)
-
-                    # graph_id=None：集成成员不写入 Zep 图谱记忆——N 个成员并发
-                    # 把各自的模拟活动写回同一个图谱会相互践踏且没有明确语义
-                    # （"图谱应该记住哪一次运行？"）。这是一个有意识的范围限制，
-                    # 而不是遗漏；需要图谱记忆更新的场景应该用单次模拟运行。
-                    SimulationRunner.start_simulation(
-                        simulation_id=member_id,
-                        platform=resolved_platform,
-                        max_rounds=max_rounds,
-                        enable_graph_memory_update=False,
-                        graph_id=None,
-                        # 集成成员没有人工操作者去调用 interview/close：不传
-                        # no_wait 的话，子进程会在跑完所有轮次后停留在等待
-                        # 命令的状态，SimulationRunner 永远看不到进程退出，
-                        # 这个成员也就永远不会变成 COMPLETED，集成也就永远
-                        # 凑不齐聚合所需的终态成员。
-                        no_wait=True,
-                    )
-                except Exception as error:
+                except Exception:
                     logger.exception(
-                        f"集成成员启动失败: ensemble_id={ensemble_id}, member_id={member_id}"
+                        f"写入集成记录快照失败（成员已启动，临时记录仍然可见）: "
+                        f"ensemble_id={ensemble_id}, member_index={index}"
                     )
-                    start_error = str(error)
-
-            members.append(EnsembleMemberRecord(
-                simulation_id=member_id,
-                index=index,
-                start_error=start_error,
-            ))
-
-            # 每尝试完一个成员就重新落盘一次快照（已尝试过的成员带着真实
-            # start_error，尚未轮到的成员沿用临时占位记录）。这样即使 worker
-            # 在循环中途整个崩溃，暴露出的"启动结果未知"窗口也只是"崩溃那
-            # 一刻正在处理的那一个成员"，而不是循环结束前才写入的整批成员。
-            # 完全消除这个窗口需要一套心跳/存活检测机制来分辨"还没轮到"和
-            # "启动器已经死了、永远不会轮到"——这类机制目前在
-            # SimulationRunner 自身的单进程架构里也没有（见模块文档第3条
-            # 引用的 TASK 7 结论），本模块选择不新增这套机制，只把已尝试
-            # 部分的可见窗口缩到最小。写入本身是尽力而为的：failure 只记
-            # 日志，不影响已经启动（或已经失败）的成员——它们是真实、可能
-            # 已产生 LLM 调用成本的进程，不应该因为记录簿记失败被回滚。
-            try:
-                # 用刚读到的最新 on-disk 状态（而不是这次调用开头缓存的
-                # current_on_disk）来决定要写回的 cancelled 值：本次迭代
-                # 启动成员的过程中，一次并发的 stop_ensemble 完全可能刚刚
-                # 才把 cancelled 置为 True——如果这里无脑写回 False（新建
-                # EnsembleRecord 默认值），就会把那次取消覆盖掉，下一轮
-                # 迭代的检查也就看不到它了。
-                latest_on_disk = cls.get_ensemble_record(ensemble_id)
-                still_cancelled = bool(latest_on_disk and latest_on_disk.cancelled)
-                atomic_write_json(
-                    cls._ensemble_path(ensemble_id),
-                    EnsembleRecord(
-                        ensemble_id=ensemble_id,
-                        source_simulation_id=source_simulation_id,
-                        project_id=source_state.project_id,
-                        graph_id=source_state.graph_id,
-                        platform=resolved_platform,
-                        max_rounds=max_rounds,
-                        run_count=run_count,
-                        members=members + provisional_members[index + 1:],
-                        created_at=provisional_record.created_at,
-                        owner_id=source_state.owner_id,
-                        cancelled=still_cancelled,
-                    ).to_dict(),
-                )
-            except Exception:
-                logger.exception(
-                    f"写入集成记录快照失败（成员已启动，临时记录仍然可见）: "
-                    f"ensemble_id={ensemble_id}, member_index={index}"
-                )
 
         if all(m.start_error is not None for m in members):
             logger.error(
@@ -492,15 +517,30 @@ class EnsembleRunner:
         # start_ensemble 内的检查）。顺序很重要——先设信号，避免出现
         # "信号还没落盘，启动循环又启动了一个新成员，而这次 stop 调用
         # 已经把已存在的成员都停完并返回成功" 的竞争窗口。
-        if not record.cancelled:
-            try:
-                record.cancelled = True
-                atomic_write_json(cls._ensemble_path(ensemble_id), record.to_dict())
-            except Exception:
-                logger.exception(
-                    f"写入集成取消信号失败（仍会继续尝试停止已存在的成员）: "
-                    f"ensemble_id={ensemble_id}"
-                )
+        #
+        # 这里必须持有与 start_ensemble 启动循环相同的 ensemble 锁：不然
+        # "读取 record.cancelled -> 判断是否要写" 和启动循环里
+        # "读取取消信号 -> 决定是否启动 -> 启动 -> 落盘" 之间仍然可能交错，
+        # 出现 stop_ensemble 恰好在启动循环通过检查之后、start_simulation
+        # 真正发布 run_state 之前运行的窄窗口——那种情况下 stop_ensemble
+        # 找不到该成员的 run_state 而跳过它，随后启动循环仍会把它启动
+        # 起来。持锁能保证这两段互斥执行。
+        with cls._ensemble_lock(ensemble_id):
+            latest_record = cls.get_ensemble_record(ensemble_id) or record
+            if not latest_record.cancelled:
+                try:
+                    latest_record.cancelled = True
+                    atomic_write_json(
+                        cls._ensemble_path(ensemble_id), latest_record.to_dict()
+                    )
+                    record = latest_record
+                except Exception:
+                    logger.exception(
+                        f"写入集成取消信号失败（仍会继续尝试停止已存在的成员）: "
+                        f"ensemble_id={ensemble_id}"
+                    )
+            else:
+                record = latest_record
 
         results: Dict[str, Any] = {}
         for member in record.members:
@@ -554,18 +594,38 @@ class EnsembleRunner:
             else:
                 run_state = SimulationRunner.get_run_state(member.simulation_id)
                 if run_state is None:
-                    # start_simulation 成功发起但还没有任何 run_state 落盘
-                    # 是不应该发生的（start_simulation 在返回前必然已经
-                    # 保存过至少一次 run_state），但防御性地把它当作仍在
-                    # 启动中处理，而不是让整个聚合请求抛异常。
-                    status = RunnerStatus.STARTING.value
-                    info = {
-                        "simulation_id": member.simulation_id,
-                        "index": member.index,
-                        "runner_status": status,
-                        "error": None,
-                    }
-                    non_terminal_count += 1
+                    if record.cancelled:
+                        # 这个成员既没有 start_error（说明启动循环从没真正
+                        # 尝试启动过它），也没有 run_state（说明
+                        # SimulationRunner.start_simulation 确实没被调用
+                        # 过）——而集成已经被标记为已取消。这只会发生在
+                        # worker 在启动循环处理到它之前就整个崩溃、随后
+                        # 一次 stop_ensemble 调用把 cancelled 设为 True 的
+                        # 场景（见模块文档第3条/第4条）。没有任何启动循环
+                        # 会再回来把它落定，所以这里主动把它归为终态，而
+                        # 不是让它作为 STARTING 永远悬在那——否则整个集成
+                        # 会永远处于 running、永远算不出聚合。
+                        status = RunnerStatus.FAILED.value
+                        info = {
+                            "simulation_id": member.simulation_id,
+                            "index": member.index,
+                            "runner_status": status,
+                            "error": "集成已被取消，且该成员在取消前从未被启动过",
+                        }
+                        failed_count += 1
+                    else:
+                        # start_simulation 成功发起但还没有任何 run_state 落盘
+                        # 是不应该发生的（start_simulation 在返回前必然已经
+                        # 保存过至少一次 run_state），但防御性地把它当作仍在
+                        # 启动中处理，而不是让整个聚合请求抛异常。
+                        status = RunnerStatus.STARTING.value
+                        info = {
+                            "simulation_id": member.simulation_id,
+                            "index": member.index,
+                            "runner_status": status,
+                            "error": None,
+                        }
+                        non_terminal_count += 1
                 else:
                     status = run_state.runner_status.value
                     info = {

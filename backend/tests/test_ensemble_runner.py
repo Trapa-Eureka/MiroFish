@@ -15,6 +15,19 @@
 import json
 import os
 import sqlite3
+import threading
+import uuid
+
+# The _isolated_dirs fixture below replaces threading.Thread globally (via
+# monkeypatch.setattr(runner_module.threading, "Thread", NoOpThread)) so
+# SimulationRunner's own monitor thread never actually runs during tests.
+# Since runner_module.threading IS the real threading module object, that
+# patch affects every `threading.Thread(...)` call for the rest of the test,
+# including ones written directly in this file. Capture the real class here,
+# at module import time (before any fixture has run), so tests that need a
+# genuine background thread (real concurrency, not SimulationRunner's
+# internal monitor) can bypass the patched threading.Thread.
+_RealThread = threading.Thread
 
 import pytest
 
@@ -22,10 +35,12 @@ from app.services import ensemble_runner as ensemble_runner_module
 from app.services.ensemble_runner import (
     MAX_ENSEMBLE_RUN_COUNT,
     MIN_ENSEMBLE_RUN_COUNT,
+    EnsembleMemberRecord,
+    EnsembleRecord,
     EnsembleRunner,
 )
 from app.services import simulation_runner as runner_module
-from app.services.simulation_runner import RunnerStatus, SimulationRunner
+from app.services.simulation_runner import RunnerStatus, SimulationRunner, SimulationRunState
 from app.services.simulation_manager import SimulationManager, SimulationState, SimulationStatus
 
 
@@ -647,61 +662,151 @@ class TestStopEnsemble:
         with pytest.raises(ValueError, match="不存在"):
             EnsembleRunner.stop_ensemble("ens_doesnotexist")
 
-    def test_stop_called_mid_launch_prevents_remaining_members_from_starting(
+    def test_ensemble_lock_returns_the_same_instance_for_the_same_id(self):
+        # Same pattern as SimulationRunner._finalization_lock: the launch
+        # loop and stop_ensemble must serialize against the *same* lock
+        # object for a given ensemble_id, or the mutual exclusion below is
+        # meaningless.
+        lock1 = EnsembleRunner._ensemble_lock("ens_same0001")
+        lock2 = EnsembleRunner._ensemble_lock("ens_same0001")
+        assert lock1 is lock2
+        lock_other = EnsembleRunner._ensemble_lock("ens_other0001")
+        assert lock_other is not lock1
+
+    def test_stop_cannot_set_cancelled_while_a_member_launch_is_in_progress(
         self, monkeypatch
     ):
-        # Regression test for the start/stop race: a concurrent stop_ensemble
-        # call sees the provisional record (written before the launch loop)
-        # but can't stop members that don't have a run_state yet. Without the
-        # cancellation flag, start_ensemble's loop would keep launching them
-        # after stop_ensemble already returned "success".
+        # Regression test for the start/stop race: without holding the same
+        # ensemble-level lock during "check cancelled -> launch -> persist",
+        # a concurrent stop_ensemble could squeeze in between the check and
+        # the launch, or have its cancellation write clobbered by the
+        # launch loop's own snapshot write. Proves the lock actually
+        # provides mutual exclusion, using a real second thread (a fake,
+        # same-thread "concurrent" call can't exercise a threading.Lock at
+        # all).
         _make_source_simulation()
 
+        # ensemble_id is normally only known after start_ensemble returns,
+        # which is exactly what this test blocks on -- so pin uuid4 to know
+        # it upfront instead of waiting for the function to return.
+        fixed_uuid = uuid.UUID("12345678123456781234567812345678")
+        monkeypatch.setattr(ensemble_runner_module.uuid, "uuid4", lambda: fixed_uuid)
+        ensemble_id = f"ens_{fixed_uuid.hex[:12]}"
+
+        member_launch_started = threading.Event()
+        release_member_launch = threading.Event()
         real_start = SimulationRunner.start_simulation
-        started_member_ids = []
 
-        def fake_stop_simulation(cls, simulation_id):
-            state = SimulationRunner.get_run_state(simulation_id)
-            state.runner_status = RunnerStatus.STOPPED
-            SimulationRunner._save_run_state(state)
-            return state
+        def blocking_start_simulation(cls, *args, **kwargs):
+            member_launch_started.set()
+            release_member_launch.wait(timeout=5)
+            return real_start(*args, **kwargs)
 
-        def start_and_cancel_after_first_member(cls, *args, **kwargs):
-            simulation_id = kwargs["simulation_id"]
-            started_member_ids.append(simulation_id)
-            result = real_start(*args, **kwargs)
-            if len(started_member_ids) == 1:
-                # Simulate a concurrent /stop request arriving right after
-                # the first member launches, while start_ensemble's loop is
-                # still about to process members 1 and 2.
-                ensemble_id = simulation_id.rsplit("_m", 1)[0]
-                EnsembleRunner.stop_ensemble(ensemble_id)
-            return result
-
-        monkeypatch.setattr(
-            SimulationRunner, "stop_simulation", classmethod(fake_stop_simulation)
-        )
         monkeypatch.setattr(
             SimulationRunner, "start_simulation",
-            classmethod(start_and_cancel_after_first_member),
+            classmethod(blocking_start_simulation),
         )
 
-        record = EnsembleRunner.start_ensemble("sim_source12345", run_count=3)
+        start_result_holder = {}
 
-        # Only the first member actually launched; the rest observed the
-        # cancellation flag before attempting to start and were never
-        # handed to SimulationRunner.start_simulation at all.
-        assert started_member_ids == [record.members[0].simulation_id]
-        assert record.members[0].start_error is None
-        assert record.members[1].start_error is not None
-        assert "取消" in record.members[1].start_error
-        assert record.members[2].start_error is not None
-        assert "取消" in record.members[2].start_error
+        def run_start_ensemble():
+            try:
+                start_result_holder["record"] = EnsembleRunner.start_ensemble(
+                    "sim_source12345", run_count=2
+                )
+            except Exception as error:
+                start_result_holder["error"] = error
 
-        # The cancellation is durable: reloading the record still shows it,
-        # and a fresh summary call reflects the already-launched member plus
-        # two cancelled (failed) ones -- never "running" forever.
-        reloaded = EnsembleRunner.get_ensemble_record(record.ensemble_id)
+        start_thread = _RealThread(target=run_start_ensemble)
+        start_thread.start()
+
+        # Wait until the launch loop is inside the locked section (blocked
+        # on release_member_launch, lock still held) before attempting stop.
+        started_in_time = member_launch_started.wait(timeout=5)
+        if not started_in_time and "error" in start_result_holder:
+            raise start_result_holder["error"]
+        assert started_in_time
+
+        def run_stop_ensemble():
+            # This must block on the ensemble lock until the in-progress
+            # member-launch critical section above releases it.
+            EnsembleRunner.stop_ensemble(ensemble_id)
+
+        stop_thread = _RealThread(target=run_stop_ensemble)
+        stop_thread.start()
+
+        # Give the stop thread every chance to run; it must NOT be able to
+        # complete while the launch critical section is still holding the
+        # lock (the provisional record already exists by this point, so if
+        # stop_ensemble could act without the lock it would return quickly).
+        stop_thread.join(timeout=0.3)
+        assert stop_thread.is_alive(), (
+            "stop_ensemble should still be blocked on the ensemble lock "
+            "while the member-launch critical section holds it"
+        )
+        reloaded_while_blocked = EnsembleRunner.get_ensemble_record(ensemble_id)
+        assert reloaded_while_blocked.cancelled is False
+
+        release_member_launch.set()
+        start_thread.join(timeout=5)
+        stop_thread.join(timeout=5)
+        assert not start_thread.is_alive()
+        assert not stop_thread.is_alive()
+
+        reloaded = EnsembleRunner.get_ensemble_record(ensemble_id)
         assert reloaded.cancelled is True
-        summary = EnsembleRunner.get_ensemble_summary(record.ensemble_id)
+        # The one member that was already launching when stop_ensemble was
+        # called must not have been clobbered/lost by the cancellation.
+        assert reloaded.members[0].simulation_id == start_result_holder["record"].members[0].simulation_id
+
+    def test_summary_finalizes_never_started_members_after_crash_and_cancel(self):
+        # Regression test for: a worker crashes mid-launch-loop, leaving
+        # some members in their pristine provisional state (no start_error,
+        # no run_state). An operator notices the stuck ensemble and calls
+        # stop_ensemble, which durably sets cancelled=True but still can't
+        # act on members with no run_state. Without the P2 fix, those
+        # members stay classified as STARTING forever and the ensemble
+        # never reaches a terminal status. Constructed by hand rather than
+        # via a real crash, which isn't reproducible in-process.
+        source = _make_source_simulation()
+        ensemble_id = "ens_crashsim01"
+        member_0_id = f"{ensemble_id}_m0"
+
+        SimulationRunner._save_run_state(
+            SimulationRunState(simulation_id=member_0_id, runner_status=RunnerStatus.RUNNING)
+        )
+
+        record = EnsembleRecord(
+            ensemble_id=ensemble_id,
+            source_simulation_id="sim_source12345",
+            project_id=source.project_id,
+            graph_id=source.graph_id,
+            platform="reddit",
+            max_rounds=None,
+            run_count=3,
+            members=[
+                EnsembleMemberRecord(simulation_id=member_0_id, index=0),
+                EnsembleMemberRecord(simulation_id=f"{ensemble_id}_m1", index=1),
+                EnsembleMemberRecord(simulation_id=f"{ensemble_id}_m2", index=2),
+            ],
+            created_at="2024-01-01T00:00:00",
+            owner_id=source.owner_id,
+            cancelled=True,
+        )
+        ensemble_runner_module.atomic_write_json(
+            EnsembleRunner._ensemble_path(ensemble_id), record.to_dict()
+        )
+
+        _complete_member(member_0_id, reddit_actions=5)
+
+        summary = EnsembleRunner.get_ensemble_summary(ensemble_id)
+        assert summary["status"] != "running"
+        assert summary["member_counts"]["running"] == 0
+        assert summary["member_counts"]["completed"] == 1
         assert summary["member_counts"]["failed"] == 2
+        for info in summary["members"]:
+            if info["simulation_id"] != member_0_id:
+                assert info["runner_status"] == RunnerStatus.FAILED.value
+                assert "取消" in info["error"]
+
+
