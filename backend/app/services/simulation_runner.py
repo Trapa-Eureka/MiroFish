@@ -28,6 +28,13 @@ from ..utils.zep import (
 from .zep_graph_memory_updater import ZepGraphMemoryManager
 from .simulation_ipc import SimulationIPCClient, CommandType, IPCResponse
 from ..utils.id_validation import validate_simulation_id, safe_join
+from ..utils.state_machine import (
+    ConcurrentModificationError,
+    InvalidStateTransitionError,
+    atomic_write_json,
+    is_valid_transition,
+    next_revision,
+)
 
 logger = get_logger('mirofish.simulation_runner')
 
@@ -48,6 +55,50 @@ class RunnerStatus(str, Enum):
     STOPPED = "stopped"
     COMPLETED = "completed"
     FAILED = "failed"
+
+
+# 运行器状态机的合法转换图，基于本文件中每一处 `runner_status = ...` 赋值
+# 逐一核对得出（包括 stop_simulation 的重试路径、_monitor_simulation 的
+# 完成/失败收尾、以及 register_cleanup 在进程重启后恢复未完成的图谱写入
+# 屏障等边缘情况）。保存时通过 _save_run_state 强制校验，任何不在此图中的
+# 转换都会被拒绝而不是被静默持久化。
+RUNNER_STATUS_TRANSITIONS: dict[str, set[str]] = {
+    RunnerStatus.IDLE.value: {RunnerStatus.STARTING.value, RunnerStatus.STOPPING.value},
+    RunnerStatus.STARTING.value: {
+        RunnerStatus.RUNNING.value,
+        RunnerStatus.FAILED.value,
+        RunnerStatus.STOPPING.value,
+    },
+    RunnerStatus.RUNNING.value: {
+        RunnerStatus.PAUSED.value,
+        RunnerStatus.STOPPING.value,
+        RunnerStatus.STOPPED.value,
+        RunnerStatus.COMPLETED.value,
+        RunnerStatus.FAILED.value,
+    },
+    RunnerStatus.PAUSED.value: {
+        RunnerStatus.RUNNING.value,
+        RunnerStatus.STOPPING.value,
+        RunnerStatus.FAILED.value,
+    },
+    RunnerStatus.STOPPING.value: {
+        RunnerStatus.STOPPED.value,
+        RunnerStatus.COMPLETED.value,
+        RunnerStatus.FAILED.value,
+    },
+    # Terminal states remain reachable from one another: restarting a
+    # simulation reuses the same simulation_id and always begins a fresh
+    # SimulationRunState at STARTING, and register_cleanup() may need to
+    # reopen the STOPPING ingestion barrier for a retained Zep updater even
+    # after a premature terminal projection.
+    RunnerStatus.STOPPED.value: {RunnerStatus.STARTING.value, RunnerStatus.STOPPING.value},
+    RunnerStatus.COMPLETED.value: {RunnerStatus.STARTING.value, RunnerStatus.STOPPING.value},
+    RunnerStatus.FAILED.value: {
+        RunnerStatus.STARTING.value,
+        RunnerStatus.STOPPING.value,
+        RunnerStatus.FAILED.value,
+    },
+}
 
 
 class SimulationStopPending(TimeoutError):
@@ -152,7 +203,10 @@ class SimulationRunState:
     
     # 进程ID（用于停止）
     process_pid: Optional[int] = None
-    
+
+    # 持久化修订号，每次成功保存自增，用于乐观并发控制（CAS）
+    revision: int = 0
+
     def add_action(self, action: AgentAction):
         """添加动作到最近动作列表"""
         self.recent_actions.insert(0, action)
@@ -192,8 +246,9 @@ class SimulationRunState:
             "completed_at": self.completed_at,
             "error": self.error,
             "process_pid": self.process_pid,
+            "revision": self.revision,
         }
-    
+
     def to_detail_dict(self) -> Dict[str, Any]:
         """包含最近动作的详细信息"""
         result = self.to_dict()
@@ -338,6 +393,7 @@ class SimulationRunner:
                 completed_at=data.get("completed_at"),
                 error=data.get("error"),
                 process_pid=data.get("process_pid"),
+                revision=data.get("revision", 0),
             )
             
             # 加载最近动作
@@ -361,19 +417,53 @@ class SimulationRunner:
             return None
     
     @classmethod
-    def _save_run_state(cls, state: SimulationRunState):
-        """保存运行状态到文件"""
+    def _save_run_state(
+        cls,
+        state: SimulationRunState,
+        *,
+        expected_revision: Optional[int] = None,
+    ):
+        """
+        保存运行状态到文件（原子写入 + 状态转换校验 + 可选的乐观并发控制）
+
+        与内存缓存 `_run_states` 中同一对象引用比较毫无意义（调用方通常是先
+        原地修改这个被缓存的对象，再调用本方法保存），因此这里始终以磁盘上
+        最后一次持久化的状态作为"上一状态"，用来校验状态转换是否合法、以及
+        （如提供 expected_revision）是否发生了并发修改。
+
+        Args:
+            state: 待保存的运行状态
+            expected_revision: 可选。调用方最后一次读取到的 revision；若磁盘上
+                当前的 revision 与此不符，说明期间发生了并发写入，抛出
+                ConcurrentModificationError 而不是静默覆盖。
+        """
         sim_dir = cls._get_sim_dir(state.simulation_id)
         os.makedirs(sim_dir, exist_ok=True)
         state_file = os.path.join(sim_dir, "run_state.json")
-        
-        data = state.to_detail_dict()
-        
-        with open(state_file, 'w', encoding='utf-8') as f:
-            json.dump(data, f, ensure_ascii=False, indent=2)
-        
+
+        previous = cls._load_run_state(state.simulation_id)
+        previous_status = previous.runner_status.value if previous else None
+        previous_revision = previous.revision if previous else None
+
+        if expected_revision is not None and previous_revision != expected_revision:
+            raise ConcurrentModificationError(
+                f"模拟 {state.simulation_id} 的运行状态已被并发修改: "
+                f"期望 revision={expected_revision}，实际 revision={previous_revision}"
+            )
+
+        if not is_valid_transition(
+            RUNNER_STATUS_TRANSITIONS, previous_status, state.runner_status.value
+        ):
+            raise InvalidStateTransitionError(
+                f"模拟 {state.simulation_id} 非法的运行状态转换: "
+                f"{previous_status!r} -> {state.runner_status.value!r}"
+            )
+
+        state.revision = next_revision(previous_revision)
+        atomic_write_json(state_file, state.to_detail_dict())
+
         cls._run_states[state.simulation_id] = state
-    
+
     @classmethod
     def start_simulation(
         cls,

@@ -19,6 +19,11 @@ from ..utils.id_validation import (
     safe_join,
     InvalidIdentifierError,
 )
+from ..utils.state_machine import (
+    ConcurrentModificationError,
+    atomic_write_json,
+    next_revision,
+)
 from .zep_entity_reader import ZepEntityReader, FilteredEntities
 from .oasis_profile_generator import OasisProfileGenerator, OasisAgentProfile
 from .simulation_config_generator import SimulationConfigGenerator, SimulationParameters
@@ -85,6 +90,9 @@ class SimulationState:
     # 所有权：创建该模拟时所属项目的 owner_id（认证未启用时为 None）
     owner_id: Optional[str] = None
 
+    # 持久化修订号，每次成功保存自增，用于乐观并发控制（CAS）
+    revision: int = 0
+
     def to_dict(self) -> Dict[str, Any]:
         """完整状态字典（内部使用）"""
         return {
@@ -107,6 +115,7 @@ class SimulationState:
             "updated_at": self.updated_at,
             "error": self.error,
             "owner_id": self.owner_id,
+            "revision": self.revision,
         }
     
     def get_default_platform(self) -> str:
@@ -165,16 +174,46 @@ class SimulationManager:
         os.makedirs(sim_dir, exist_ok=True)
         return sim_dir
     
-    def _save_simulation_state(self, state: SimulationState):
-        """保存模拟状态到文件"""
+    def _read_persisted_revision(self, simulation_id: str) -> Optional[int]:
+        """直接从磁盘读取当前已持久化的 revision（绕过内存缓存）。"""
+        sim_dir = self._get_simulation_dir(simulation_id)
+        state_file = os.path.join(sim_dir, "state.json")
+        if not os.path.exists(state_file):
+            return None
+        try:
+            with open(state_file, 'r', encoding='utf-8') as f:
+                return json.load(f).get("revision", 0)
+        except Exception:
+            return None
+
+    def _save_simulation_state(
+        self,
+        state: SimulationState,
+        *,
+        expected_revision: Optional[int] = None,
+    ):
+        """
+        保存模拟状态到文件（原子写入 + 可选的乐观并发控制）
+
+        注意：state.json 是 run_state.json（SimulationRunner 中的权威运行状态机）
+        的派生投影，其状态字段本身不做严格的转换校验——校验逻辑属于权威来源。
+        这里只保证持久化本身是原子的，并在调用方需要时提供 CAS 保护。
+        """
         sim_dir = self._get_simulation_dir(state.simulation_id)
         state_file = os.path.join(sim_dir, "state.json")
-        
+
+        previous_revision = self._read_persisted_revision(state.simulation_id)
+        if expected_revision is not None and previous_revision != expected_revision:
+            raise ConcurrentModificationError(
+                f"模拟 {state.simulation_id} 的状态已被并发修改: "
+                f"期望 revision={expected_revision}，实际 revision={previous_revision}"
+            )
+
         state.updated_at = datetime.now().isoformat()
-        
-        with open(state_file, 'w', encoding='utf-8') as f:
-            json.dump(state.to_dict(), f, ensure_ascii=False, indent=2)
-        
+        state.revision = next_revision(previous_revision)
+
+        atomic_write_json(state_file, state.to_dict())
+
         self._simulations[state.simulation_id] = state
     
     def _load_simulation_state(self, simulation_id: str) -> Optional[SimulationState]:
@@ -211,6 +250,7 @@ class SimulationManager:
             updated_at=data.get("updated_at", datetime.now().isoformat()),
             error=data.get("error"),
             owner_id=data.get("owner_id"),
+            revision=data.get("revision", 0),
         )
         
         self._simulations[simulation_id] = state
