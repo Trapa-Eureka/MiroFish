@@ -179,6 +179,7 @@ def build_manifest(
     sim_dir: str,
     project=None,
     sim_params=None,
+    document_text: Optional[str] = None,
 ) -> ReproducibilityManifest:
     """
     构建一份可复现性清单。
@@ -186,21 +187,30 @@ def build_manifest(
     Args:
         state: SimulationState（已完成 profile / config 生成）
         sim_dir: 该模拟的持久化目录（包含 profiles / config 等产物文件）
-        project: 对应的 Project（可选；提供时用于计算本体与源文档哈希）
+        project: 对应的 Project（可选；提供时用于计算本体哈希，以及在未显式
+            传入 document_text 时作为源文档哈希的后备来源）
         sim_params: SimulationConfigGenerator 生成的 SimulationParameters（可选；
             提供时用于计算 agent_count）
+        document_text: prepare_simulation 本次实际使用的源文档文本。应始终
+            传入这个值而不是让本函数重新从 Project 读取——调用方接收到的
+            document_text 参数可能与 Project 当前持久化的提取文本不一致
+            （例如后续被重新上传/覆盖），此时重新读取会让清单记录错误的
+            源文档指纹。
     """
     ontology_hash = sha256_json(project.ontology) if project else None
 
-    source_document_hash = None
-    if project:
-        try:
-            from ..models.project import ProjectManager
-            source_document_hash = sha256_text(
-                ProjectManager.get_extracted_text(project.project_id)
-            )
-        except Exception:
-            logger.exception(f"计算源文档哈希失败: project_id={project.project_id}")
+    if document_text is not None:
+        source_document_hash = sha256_text(document_text)
+    else:
+        source_document_hash = None
+        if project:
+            try:
+                from ..models.project import ProjectManager
+                source_document_hash = sha256_text(
+                    ProjectManager.get_extracted_text(project.project_id)
+                )
+            except Exception:
+                logger.exception(f"计算源文档哈希失败: project_id={project.project_id}")
 
     reddit_path = os.path.join(sim_dir, "reddit_profiles.json")
     twitter_path = os.path.join(sim_dir, "twitter_profiles.csv")

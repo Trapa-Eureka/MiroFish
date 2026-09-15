@@ -286,7 +286,14 @@ class OasisProfileGenerator:
         - 同一实体在同一 random_seed 下总是得到相同的兜底默认值；
         - 不同实体、不同模拟之间互不干扰，即使它们在线程池中并发生成；
         - 不会像重新播种全局 `random` 模块那样，在并发场景下产生竞争。
+
+        若未提供 random_seed（如独立调用 /generate-profiles 接口，不经过
+        prepare_simulation），则保持原有的真正非确定性行为，直接使用
+        进程全局的 random 模块，而不是把字面量 "None" 当作种子——否则会让
+        原本每次调用都应不同的用户名/兜底人设字段变成确定性的。
         """
+        if self.random_seed is None:
+            return random
         return random.Random(f"{self.random_seed}:{entity_uuid}")
 
     def generate_profile_from_entity(

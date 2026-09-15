@@ -539,6 +539,7 @@ class SimulationManager:
                     sim_dir=sim_dir,
                     project=project,
                     sim_params=sim_params,
+                    document_text=document_text,
                 )
                 reproducibility_manifest.save_manifest(sim_dir, manifest)
             except Exception:

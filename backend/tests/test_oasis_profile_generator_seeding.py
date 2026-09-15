@@ -72,6 +72,25 @@ class TestEntityRngDeterminism:
         )
         assert isinstance(result["age"], int)
 
+    def test_no_seed_preserves_original_nondeterministic_behavior(self):
+        # Regression test: a generator with no random_seed (e.g. the
+        # /generate-profiles endpoint, which never passes one) must keep
+        # producing genuinely different values across repeated calls for the
+        # same entity -- it must not treat the literal string "None" as a
+        # real seed and become artificially deterministic.
+        gen = _generator(None)
+        suffixes = {
+            gen._generate_username("Alice", gen._entity_rng("entity-1"))
+            for _ in range(30)
+        }
+        assert len(suffixes) > 1
+
+    def test_entity_rng_is_the_global_random_module_when_unseeded(self):
+        gen = _generator(None)
+        import random as random_module
+
+        assert gen._entity_rng("entity-1") is random_module
+
 
 class TestConcurrentSimulationsDoNotInterfere:
     """

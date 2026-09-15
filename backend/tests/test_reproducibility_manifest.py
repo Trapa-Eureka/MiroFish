@@ -179,3 +179,55 @@ class TestBuildManifest:
         manifest = build_manifest(state=state, sim_dir=str(tmp_path))
         assert manifest.artifacts.reddit_profiles_hash is None
         assert manifest.artifacts.twitter_profiles_hash is not None
+
+    def test_explicit_document_text_is_hashed_directly(self, tmp_path):
+        # Regression test: build_manifest must hash the document_text that was
+        # actually used for preparation, not silently re-read a (possibly
+        # different) copy from the project's persisted extracted text.
+        state = _FakeState()
+        project = _FakeProject("proj_buildtest12", ontology=None)
+        manifest = build_manifest(
+            state=state,
+            sim_dir=str(tmp_path),
+            project=project,
+            document_text="the exact text passed to prepare_simulation",
+        )
+        assert manifest.artifacts.source_document_hash == sha256_text(
+            "the exact text passed to prepare_simulation"
+        )
+
+    def test_explicit_document_text_overrides_project_extracted_text(
+        self, tmp_path, monkeypatch
+    ):
+        from app.models.project import ProjectManager
+
+        monkeypatch.setattr(
+            ProjectManager, "get_extracted_text", staticmethod(lambda project_id: "stale project text")
+        )
+        state = _FakeState()
+        project = _FakeProject("proj_buildtest12", ontology=None)
+
+        manifest = build_manifest(
+            state=state,
+            sim_dir=str(tmp_path),
+            project=project,
+            document_text="fresh text actually used this run",
+        )
+        assert manifest.artifacts.source_document_hash == sha256_text(
+            "fresh text actually used this run"
+        )
+        assert manifest.artifacts.source_document_hash != sha256_text("stale project text")
+
+    def test_no_document_text_falls_back_to_project_extracted_text(
+        self, tmp_path, monkeypatch
+    ):
+        from app.models.project import ProjectManager
+
+        monkeypatch.setattr(
+            ProjectManager, "get_extracted_text", staticmethod(lambda project_id: "text from disk")
+        )
+        state = _FakeState()
+        project = _FakeProject("proj_buildtest12", ontology=None)
+
+        manifest = build_manifest(state=state, sim_dir=str(tmp_path), project=project)
+        assert manifest.artifacts.source_document_hash == sha256_text("text from disk")
