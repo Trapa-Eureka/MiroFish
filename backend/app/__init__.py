@@ -55,6 +55,11 @@ def create_app(config_class=Config):
     if should_log_startup:
         logger.info("已注册模拟进程清理函数")
 
+    # 立即构造 TaskManager 单例以触发任务崩溃恢复（图谱构建/模拟准备/报告生成
+    # 共用同一套任务状态机），而不是等到第一次 API 请求才被动触发
+    from .models.task import TaskManager
+    TaskManager()
+
     if should_log_startup and not Config.API_KEYS:
         logger.warning(
             "MIROFISH_API_KEYS 未配置：API 认证已禁用，任何人都可以匿名访问所有接口。"
