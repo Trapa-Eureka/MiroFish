@@ -349,11 +349,44 @@ class SimulationRunner:
             )
     
     @classmethod
-    def get_run_state(cls, simulation_id: str) -> Optional[SimulationRunState]:
-        """获取运行状态"""
-        if simulation_id in cls._run_states:
+    def get_run_state(cls, simulation_id: str, force_reload: bool = False) -> Optional[SimulationRunState]:
+        """
+        获取运行状态。
+
+        默认优先返回本进程内存中缓存的状态——这对绝大多数调用方（状态
+        轮询、监控线程等）都是合适的：缓存只会在本进程自己启动/监控过
+        这个模拟时才存在，本来就该由这个进程的视角为准，且轮询天然会
+        很快看到下一次更新。
+
+        但对于那些要把"当前状态"当场用来做一次不可撤销决定的调用方
+        （例如把某次已完成的模拟结果锁定成回测证据），本进程缓存里的
+        "COMPLETED" 可能只是历史快照——同一个 simulation_id 完全可以在
+        另一个 worker 进程里被重新启动过，磁盘上的 run_state.json 早已
+        变成 STARTING/RUNNING，本进程的缓存却还没有任何理由去刷新。
+        force_reload=True 会跳过缓存、强制从磁盘重新读取，把这一次读到
+        的结果直接返回给调用方。
+
+        force_reload 的读盘结果特意不会被写回 cls._run_states：这个缓存
+        里存的不是不可变快照，而是调用方（例如监控线程）在调用
+        _save_run_state 持久化之前，会直接原地修改的同一个对象引用——
+        意味着"revision 相同"不代表"内容相同"（缓存里可能已经有了还没
+        持久化的最新字段修改），"revision 更大"也不代表"已经落盘成功"
+        （_save_run_state 在磁盘写入真正完成之前就可能已经把 revision
+        递增并更新了缓存）。用一次 force_reload 读盘的结果去覆盖这份
+        缓存，无论按 revision 大小做何种比较，都有可能把一份还没保存的
+        原地修改覆盖掉，或者反过来让缓存里出现一份从未真正落盘、下次
+        进程重启就会消失的"幽灵"状态——而这份缓存会被其余所有不带
+        force_reload 的正常调用方（状态轮询、重启校验、监控线程自己）
+        长期依赖。因此 force_reload 只读、不写：它只为这一次调用提供一份
+        当下最准确的磁盘快照，完全不触碰共享缓存，把"缓存该在什么时候
+        更新"这个决定完整留给 _save_run_state 自己的正常写入路径。
+        """
+        if not force_reload and simulation_id in cls._run_states:
             return cls._run_states[simulation_id]
-        
+
+        if force_reload:
+            return cls._load_run_state(simulation_id)
+
         # 尝试从文件加载
         state = cls._load_run_state(simulation_id)
         if state:

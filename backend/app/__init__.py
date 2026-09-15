@@ -94,11 +94,12 @@ def create_app(config_class=Config):
         return response
     
     # 注册蓝图
-    from .api import graph_bp, simulation_bp, report_bp, ensemble_bp
+    from .api import graph_bp, simulation_bp, report_bp, ensemble_bp, backtest_bp
     app.register_blueprint(graph_bp, url_prefix='/api/graph')
     app.register_blueprint(simulation_bp, url_prefix='/api/simulation')
     app.register_blueprint(report_bp, url_prefix='/api/report')
     app.register_blueprint(ensemble_bp, url_prefix='/api/ensemble')
+    app.register_blueprint(backtest_bp, url_prefix='/api/backtest')
     
     # 健康检查
     @app.route('/health')
