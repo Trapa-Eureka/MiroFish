@@ -562,6 +562,7 @@ class SimulationRunner:
                 state.error = f"Zep图谱更新器初始化失败: {e}"
                 with cls._finalization_lock(simulation_id):
                     cls._save_run_state(state)
+                    cls._save_terminal_checkpoint(simulation_id, state)
                     cls._sync_simulation_status(
                         simulation_id,
                         RunnerStatus.FAILED,
@@ -601,6 +602,7 @@ class SimulationRunner:
                 state.error += f"; Zep图谱写入清理失败: {cleanup_error}"
             with cls._finalization_lock(simulation_id):
                 cls._save_run_state(state)
+                cls._save_terminal_checkpoint(simulation_id, state)
                 cls._sync_simulation_status(
                     simulation_id,
                     RunnerStatus.FAILED,
@@ -716,6 +718,7 @@ class SimulationRunner:
                 state.error += "; " + "; ".join(cleanup_errors)
             with cls._finalization_lock(simulation_id):
                 cls._save_run_state(state)
+                cls._save_terminal_checkpoint(simulation_id, state)
                 cls._sync_simulation_status(
                     simulation_id,
                     RunnerStatus.FAILED,

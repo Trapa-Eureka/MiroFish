@@ -345,12 +345,14 @@ class TestStartSimulationResetsStaleCheckpoint:
                     simulation_id, platform="twitter", enable_graph_memory_update=False
                 )
 
-            # Even though startup failed after the claim, the checkpoint must
-            # already reflect the NEW run (round 0, starting) rather than the
-            # previous run's stale round=42/completed snapshot.
+            # The stale previous run's round=42/completed snapshot must be
+            # gone. The monitor-thread-start failure is caught by
+            # start_simulation's own cleanup path, which now also persists a
+            # terminal checkpoint -- so the final state is an honest "failed
+            # at round 0", not a checkpoint stuck forever at "starting".
             checkpoint = load_checkpoint(str(sim_dir))
             assert checkpoint["twitter_round"] == 0
-            assert checkpoint["runner_status"] == "starting"
+            assert checkpoint["runner_status"] == "failed"
         finally:
             SimulationRunner._run_states.pop(simulation_id, None)
             SimulationRunner._processes.pop(simulation_id, None)
@@ -419,3 +421,46 @@ class TestStopSimulationWithoutMonitorThreadSavesCheckpoint:
         assert checkpoint is not None
         assert checkpoint["runner_status"] == "stopped"
         assert checkpoint["twitter_round"] == 17
+
+
+class TestStartupFailureBeforeMonitorPersistsCheckpoint:
+    """
+    Regression test for Codex's round-3 finding: several start_simulation
+    failure paths (missing script, Zep updater init failure, Popen/monitor
+    launch failure) happen before a monitor thread ever exists to finalize
+    a checkpoint. Without an explicit terminal checkpoint in each of those
+    paths, GET .../checkpoint would report "starting" forever after a
+    startup failure, rather than an honest "failed".
+    """
+
+    def test_missing_script_persists_failed_checkpoint(self, tmp_path, monkeypatch):
+        simulation_id = "sim_noscript1234"
+        sim_dir = tmp_path / "runs" / simulation_id
+        scripts_dir = tmp_path / "scripts"  # intentionally left empty: no script file
+        sim_dir.mkdir(parents=True)
+        scripts_dir.mkdir()
+        (sim_dir / "simulation_config.json").write_text(
+            json.dumps({
+                "time_config": {"total_simulation_hours": 1, "minutes_per_round": 60},
+            }),
+            encoding="utf-8",
+        )
+
+        monkeypatch.setattr(SimulationRunner, "RUN_STATE_DIR", str(tmp_path / "runs"))
+        monkeypatch.setattr(SimulationRunner, "SCRIPTS_DIR", str(scripts_dir))
+        monkeypatch.setattr(
+            SimulationRunner, "_sync_simulation_status", classmethod(lambda *a, **k: None)
+        )
+
+        try:
+            with pytest.raises(ValueError, match="脚本不存在"):
+                SimulationRunner.start_simulation(
+                    simulation_id, platform="twitter", enable_graph_memory_update=False
+                )
+
+            checkpoint = load_checkpoint(str(sim_dir))
+            assert checkpoint is not None
+            assert checkpoint["runner_status"] == "failed"
+        finally:
+            SimulationRunner._run_states.pop(simulation_id, None)
+            SimulationRunner._graph_memory_enabled.pop(simulation_id, None)
